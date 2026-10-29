@@ -1,0 +1,13 @@
+# 编译输出
+target/
+dist/
+
+# 唤醒词模型（约 39 MB，按 README 下载）
+models/
+
+# 本地数据和凭据
+*.log
+.env
+.env.*
+*.pem
+*.key

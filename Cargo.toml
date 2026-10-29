@@ -1,0 +1,56 @@
+[package]
+name = "voice-assistant"
+version = "0.1.0"
+edition = "2024"
+description = "轻量 AI 语音助手：唤醒词 + 云端流式识别 + DeepSeek + 桌面/浏览器控制"
+
+[dependencies]
+# unstable-winit-030：拿到原生窗口，让标题栏颜色和界面背景一致
+slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-software", "unstable-winit-030"] }
+tray-icon = "0.26"
+cpal = "0.18"
+uiautomation = "0.25"
+# DLL 版：预编译的静态库需要 VS 17.10+ 的 MSVC，DLL 版不受编译器版本影响
+sherpa-onnx = { version = "2.0.1", default-features = false, features = ["shared"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+pinyin = "0.11"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_Media_Speech",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+slint-build = "1.18"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
