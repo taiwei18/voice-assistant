@@ -896,6 +896,11 @@ export component AppWindow inherits Window {
     in-out property <float> tts-rate;
     in-out property <bool> show-on-start;
     in-out property <bool> float-ball;
+    in-out property <bool> hotkey;
+    // 快捷键已生效时是它的名字（空 = 没有可用的快捷键）；note 是设置页的说明
+    in property <string> hotkey-label;
+    in property <string> hotkey-note;
+    in property <bool> task-running;
     in-out property <bool> launch-at-login;
     in-out property <string> settings-note;
     // 0 成功  1 出错  2 普通说明
@@ -990,9 +995,10 @@ export component AppWindow inherits Window {
                     color: Theme.ink;
                 }
                 Text {
-                    text: root.mic-name == "" ? "正在准备麦克风…" : root.mic-name;
+                    text: root.task-running ? "后台任务进行中，可以接着聊天"
+                        : root.mic-name == "" ? "正在准备麦克风…" : root.mic-name;
                     font-size: 11px;
-                    color: Theme.ink-3;
+                    color: root.task-running ? Theme.ok : Theme.ink-3;
                     overflow: elide;
                 }
             }
@@ -1043,8 +1049,8 @@ export component AppWindow inherits Window {
                         horizontal-alignment: center;
                     }
                     Text {
-                        text: !root.listening-enabled ? "语音唤醒已暂停，点下方的光球直接说话"
-                            : "说“" + root.first-wake-word + "”唤醒我，或者点下方的光球";
+                        text: (!root.listening-enabled ? "语音唤醒已暂停，" : "说“" + root.first-wake-word + "”唤醒我，")
+                            + (root.hotkey-label != "" ? "按 " + root.hotkey-label + " 或点下方的光球也可以" : "或者点下方的光球");
                         font-size: 13px;
                         color: Theme.ink-3;
                         horizontal-alignment: center;
@@ -1550,6 +1556,15 @@ export component AppWindow inherits Window {
                                 source: Icons.refresh;
                                 clicked => { root.refresh-devices(); }
                             }
+                        }
+                    }
+                    Divider { }
+                    SettingRow {
+                        title: "快捷键说话";
+                        description: root.hotkey-note;
+                        VerticalLayout {
+                            alignment: center;
+                            Toggle { checked <=> root.hotkey; }
                         }
                     }
                     Divider { }

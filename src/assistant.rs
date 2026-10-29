@@ -63,6 +63,8 @@ pub enum UiEvent {
     Chat(Role, String),
     /// 后台任务的最新进展：连续的进展只占一行，原地更新
     TaskProgress(u32, String),
+    /// 是否有后台任务在跑
+    TaskRunning(bool),
     Mic(String),
 }
 

@@ -17,13 +17,17 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, UnregisterHotKey, VK_SPACE,
+};
+use windows::Win32::UI::Shell::{QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetCursorPos, GetWindowRect,
     IDC_HAND, KillTimer, LoadCursorW, MF_SEPARATOR, MF_STRING, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE,
     SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, ULW_ALPHA, UpdateLayeredWindow, WM_CAPTURECHANGED,
-    WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW,
+    WM_DPICHANGED, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
@@ -32,6 +36,11 @@ use windows::core::{PCWSTR, w};
 const BOX: f32 = 96.0;
 const RADIUS: f32 = 26.0;
 const TIMER_ID: usize = 1;
+/// 每秒看一次前台是不是全屏程序（游戏、全屏视频、演示），是就先藏起来
+const WATCH_TIMER_ID: usize = 2;
+const HOTKEY_ID: i32 = 1;
+/// 全局快捷键的显示名，设置页和提示里用
+pub const HOTKEY_LABEL: &str = "Ctrl+Alt+空格";
 /// TrackMouseEvent 的离开通知（这个版本的 windows crate 没有导出）
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
@@ -70,7 +79,12 @@ struct Ball {
     mode: i32,
     hover: bool,
     listening: bool,
+    /// 有后台任务在跑：球的右上角亮一个小点
+    task: bool,
+    /// 想不想显示（主界面关着、开了悬浮球）
     visible: bool,
+    /// 实际是否显示：想显示，且前台没有全屏程序
+    shown: bool,
     enabled: bool,
     /// 按下时的光标位置和窗口位置
     down: Option<(POINT, i32, i32)>,
@@ -129,7 +143,9 @@ pub fn create(pos: Option<(i32, i32)>, enabled: bool, on_event: impl Fn(BallEven
                 mode: 0,
                 hover: false,
                 listening: true,
+                task: false,
                 visible: false,
+                shown: false,
                 enabled,
                 down: None,
                 dragging: false,
@@ -173,7 +189,7 @@ pub fn set_state(mode: i32) {
     let Some((hwnd, start, stop)) = with_ball(|b| {
         b.mode = mode;
         let active = (1..=4).contains(&mode);
-        let start = active && !b.timer_on && b.visible;
+        let start = active && !b.timer_on && b.shown;
         let stop = !active && b.timer_on;
         if start {
             b.timer_on = true;
@@ -221,22 +237,67 @@ pub fn show_if_enabled() {
 }
 
 pub fn set_visible(visible: bool) {
-    let Some((hwnd, mode)) = with_ball(|b| {
+    let Some(hwnd) = with_ball(|b| {
         b.visible = visible;
-        (b.hwnd, b.mode)
+        b.hwnd
     }) else {
         return;
     };
     unsafe {
-        let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        if visible {
+            SetTimer(Some(hwnd), WATCH_TIMER_ID, 1000, None);
+        } else {
+            let _ = KillTimer(Some(hwnd), WATCH_TIMER_ID);
+        }
     }
-    if visible {
+    apply_visibility();
+}
+
+/// 前台是全屏程序：游戏、全屏视频、PPT 放映
+fn fullscreen_app_in_front() -> bool {
+    unsafe { SHQueryUserNotificationState() }
+        .is_ok_and(|s| s == QUNS_BUSY || s == QUNS_RUNNING_D3D_FULL_SCREEN || s == QUNS_PRESENTATION_MODE)
+}
+
+/// 按“想不想显示”和“前台是不是全屏”决定实际显示与否，有变化才动窗口
+fn apply_visibility() {
+    let show = with_ball(|b| b.visible).unwrap_or(false) && !fullscreen_app_in_front();
+    let Some((hwnd, mode, changed)) = with_ball(|b| {
+        let changed = b.shown != show;
+        b.shown = show;
+        (b.hwnd, b.mode, changed)
+    }) else {
+        return;
+    };
+    if !changed {
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(hwnd, if show { SW_SHOWNOACTIVATE } else { SW_HIDE });
+    }
+    if show {
         set_state(mode); // 重新判断是否需要动画
     } else {
         unsafe {
             let _ = KillTimer(Some(hwnd), TIMER_ID);
         }
         with_ball(|b| b.timer_on = false);
+    }
+}
+
+/// 有没有后台任务在跑
+pub fn set_task_running(on: bool) {
+    if with_ball(|b| std::mem::replace(&mut b.task, on) != on) == Some(true) {
+        redraw();
+    }
+}
+
+/// 开关全局快捷键（按一下开始说话，再按一下停止）。返回快捷键是否可用（关闭时总是 true）
+pub fn set_hotkey(on: bool) -> bool {
+    let Some(hwnd) = with_ball(|b| b.hwnd) else { return !on };
+    unsafe {
+        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+        !on || RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32).is_ok()
     }
 }
 
@@ -279,7 +340,7 @@ fn redraw() {
         let canvas = b.canvas.as_ref()?;
         let pixels = unsafe { std::slice::from_raw_parts_mut(canvas.bits, (n * n) as usize) };
         let t = b.started.elapsed().as_secs_f32();
-        render(pixels, n as usize, b.scale, b.mode, b.hover, t);
+        render(pixels, n as usize, b.scale, b.mode, b.hover, b.task, t);
         Some((b.hwnd, canvas.dc, n))
     });
     // 2. 借用结束后再交给系统合成
@@ -348,7 +409,7 @@ fn capsule(x: f32, y: f32, cx: f32, half_h: f32, half_w: f32) -> f32 {
     (0.5 - d).clamp(0.0, 1.0)
 }
 
-fn render(px: &mut [u32], n: usize, s: f32, mode: i32, hover: bool, t: f32) {
+fn render(px: &mut [u32], n: usize, s: f32, mode: i32, hover: bool, task: bool, t: f32) {
     let c = n as f32 / 2.0;
     let r = RADIUS * s;
     let active = (1..=4).contains(&mode);
@@ -441,6 +502,14 @@ fn render(px: &mut [u32], n: usize, s: f32, mode: i32, hover: bool, t: f32) {
                     }
                 }
                 over(&mut p, white, glyph * 0.96 * cover);
+            }
+
+            // 6. 后台任务进行中：右上角一个带白边的小点
+            if task {
+                let (bx, by) = (fx - 0.74 * r, fy + 0.74 * r);
+                let bd = (bx * bx + by * by).sqrt();
+                over(&mut p, white, (5.5 * s - bd + 0.5).clamp(0.0, 1.0));
+                over(&mut p, [0.13, 0.77, 0.37], (4.0 * s - bd + 0.5).clamp(0.0, 1.0));
             }
 
             // 预乘 BGRA
@@ -584,7 +653,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 LRESULT(0)
             }
             WM_TIMER => {
-                redraw();
+                if wparam.0 == WATCH_TIMER_ID {
+                    apply_visibility();
+                } else {
+                    redraw();
+                }
+                LRESULT(0)
+            }
+            WM_HOTKEY => {
+                emit(BallEvent::Talk);
                 LRESULT(0)
             }
             WM_DPICHANGED => {

@@ -103,6 +103,7 @@ fn main() -> anyhow::Result<()> {
         eprintln!("悬浮球创建失败：{e}");
     }
     sync_listening_menus(cfg.listen_on_start);
+    apply_hotkey(&window, cfg.hotkey);
     let weak = window.as_weak();
     window.window().on_close_requested(move || {
         // 下次打开回到对话页；设置改了没保存时留在原处，不丢改动
@@ -195,6 +196,7 @@ fn on_ui_event(w: &AppWindow, ev: UiEvent) {
         UiEvent::Status(s) => println!("[状态] {s:?}"),
         UiEvent::Chat(role, text) => println!("[{role:?}] {text}"),
         UiEvent::TaskProgress(id, text) => println!("[任务 #{id}] {text}"),
+        UiEvent::TaskRunning(on) => println!("[后台任务进行中] {on}"),
         UiEvent::Mic(name) => println!("[麦克风] {name}"),
         UiEvent::Partial(_) => {}
     }
@@ -207,6 +209,10 @@ fn on_ui_event(w: &AppWindow, ev: UiEvent) {
         UiEvent::Mic(name) => w.set_mic_name(name.into()),
         UiEvent::Chat(role, text) => push_chat(w, role as i32, text, None),
         UiEvent::TaskProgress(id, text) => push_chat(w, assistant::Role::Tool as i32, format!("任务 #{id} · {text}"), Some(id)),
+        UiEvent::TaskRunning(on) => {
+            w.set_task_running(on);
+            ball::set_task_running(on);
+        }
     }
 }
 
@@ -329,6 +335,7 @@ fn apply_config(w: &AppWindow, c: &Config, devices: &[String]) {
     w.set_tts_rate(c.tts_rate as f32);
     w.set_show_on_start(c.show_window_on_start);
     w.set_float_ball(c.float_ball);
+    w.set_hotkey(c.hotkey);
     w.set_launch_at_login(sys::autostart_enabled()); // 以注册表为准
     w.set_executor_index(EXECUTORS.iter().position(|e| *e == c.executor).unwrap_or(0) as i32);
     w.set_access_index(ACCESS.iter().position(|e| *e == c.agent_access).unwrap_or(0) as i32);
@@ -381,6 +388,7 @@ fn fill_settings(w: &AppWindow, devices: &[String], c: &mut Config) {
     c.tts_rate = w.get_tts_rate().round() as i32;
     c.show_window_on_start = w.get_show_on_start();
     c.float_ball = w.get_float_ball();
+    c.hotkey = w.get_hotkey();
     c.executor = EXECUTORS[w.get_executor_index().clamp(0, 2) as usize].into();
     c.agent_access = ACCESS[w.get_access_index().clamp(0, 2) as usize].into();
     c.agent_workdir = text(w.get_agent_workdir());
@@ -495,6 +503,7 @@ fn wire_settings(window: &AppWindow, cmd_tx: &UnboundedSender<Command>, devices:
                 w.set_asr_key_input("".into());
                 refresh_key_status(&w, &c);
                 ball::set_enabled(c.float_ball);
+                apply_hotkey(&w, c.hotkey);
                 let (kind, note) = match sys::set_autostart(w.get_launch_at_login()) {
                     Ok(()) => (NOTE_OK, "已保存并生效".to_string()),
                     Err(e) => (NOTE_ERROR, format!("已保存，但开机自启设置失败：{e}")),
@@ -708,6 +717,20 @@ fn talk_or_stop(w: &AppWindow, tx: &UnboundedSender<Command>) {
     } else {
         let _ = tx.send(Command::Talk);
     }
+}
+
+/// 注册或取消全局快捷键，结果显示在设置页和空状态提示里
+fn apply_hotkey(w: &AppWindow, on: bool) {
+    let ok = ball::set_hotkey(on);
+    w.set_hotkey_label(if on && ok { ball::HOTKEY_LABEL.into() } else { "".into() });
+    w.set_hotkey_note(
+        if !ok {
+            format!("{} 已被其他程序占用，没能启用", ball::HOTKEY_LABEL)
+        } else {
+            format!("按 {} 开始说话；听、思考或回答时再按一下停止", ball::HOTKEY_LABEL)
+        }
+        .into(),
+    );
 }
 
 fn toggle_listening(w: &AppWindow, tx: &UnboundedSender<Command>) {

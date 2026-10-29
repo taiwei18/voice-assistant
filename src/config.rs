@@ -78,6 +78,8 @@ pub struct Config {
 
     // 悬浮球
     pub float_ball: bool,
+    /// 全局快捷键 Ctrl+Alt+空格：开始说话 / 停止
+    pub hotkey: bool,
     /// 悬浮球上次的位置（物理像素）；i32::MIN 表示用默认位置
     pub ball_x: i32,
     pub ball_y: i32,
@@ -135,6 +137,7 @@ impl Default for Config {
             tts_rate: 1,
             theme: "auto".into(),
             float_ball: true,
+            hotkey: true,
             ball_x: i32::MIN,
             ball_y: i32::MIN,
             config_version: CONFIG_VERSION,

@@ -137,6 +137,7 @@ impl TaskManager {
             id
         };
         (self.ui)(UiEvent::Chat(Role::Tool, format!("任务 #{id} 交给 {name} 在后台处理：{description}")));
+        (self.ui)(UiEvent::TaskRunning(true));
         let me = self.clone();
         let prompt = format!("{TASK_PROMPT}{description}");
         let join = tokio::spawn(async move {
@@ -209,6 +210,7 @@ impl TaskManager {
             h.abort();
         }
         (self.ui)(UiEvent::Chat(Role::Tool, format!("任务 #{} 已取消", t.id)));
+        (self.ui)(UiEvent::TaskRunning(false)); // 同一时间只跑一个任务
         (format!("已取消任务 {}", t.id), false)
     }
 
@@ -252,6 +254,7 @@ impl TaskManager {
         t.state = if ok { State::Done } else { State::Failed };
         t.progress = text.chars().take(80).collect();
         t.result = text.clone();
+        (self.ui)(UiEvent::TaskRunning(false));
         let _ = self.done_tx.send(TaskDone { id, ok, text });
     }
 
