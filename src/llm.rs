@@ -70,7 +70,14 @@ impl Llm {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            bail!("大模型返回 {status}：{}", text.chars().take(300).collect::<String>());
+            let detail: String = text.chars().take(300).collect();
+            match status.as_u16() {
+                401 | 403 => bail!("大模型的 API Key 无效或已过期，请在“设置”里更新（{status}）"),
+                402 => bail!("大模型账户余额不足，请充值后再试（{status}）"),
+                429 => bail!("大模型请求太频繁或额度用完了，请稍后再试（{status}）"),
+                500..=599 => bail!("大模型服务暂时不可用，请稍后再试（{status}）"),
+                _ => bail!("大模型返回 {status}：{detail}"),
+            }
         }
         Ok(serde_json::from_str(&text)?)
     }

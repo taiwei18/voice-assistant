@@ -484,11 +484,12 @@ fn snap(hwnd: HWND) -> (i32, i32) {
 }
 
 unsafe fn show_menu(hwnd: HWND) {
-    let listening = with_ball(|b| b.listening).unwrap_or(true);
+    let (listening, busy) = with_ball(|b| (b.listening, (1..=4).contains(&b.mode))).unwrap_or((true, false));
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let _ = AppendMenuW(menu, MF_STRING, 1, w!("打开主界面"));
-        let _ = AppendMenuW(menu, MF_STRING, 2, w!("开始说话"));
+        // 正在听/思考/回答时，这一项变成停止（和点主界面光球一样）
+        let _ = AppendMenuW(menu, MF_STRING, 2, if busy { w!("停止") } else { w!("开始说话") });
         let _ = AppendMenuW(menu, MF_STRING, 3, if listening { w!("暂停语音唤醒") } else { w!("恢复语音唤醒") });
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, 4, w!("隐藏悬浮球"));

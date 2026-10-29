@@ -103,7 +103,15 @@ fn main() -> anyhow::Result<()> {
         eprintln!("悬浮球创建失败：{e}");
     }
     sync_listening_menus(cfg.listen_on_start);
-    window.window().on_close_requested(|| {
+    let weak = window.as_weak();
+    window.window().on_close_requested(move || {
+        // 下次打开回到对话页；设置改了没保存时留在原处，不丢改动
+        if let Some(w) = weak.upgrade() {
+            if w.get_page() == 1 && !w.get_settings_dirty() {
+                w.set_page(0);
+                w.set_settings_note("".into());
+            }
+        }
         ball::show_if_enabled();
         slint::CloseRequestResponse::HideWindow
     });
@@ -234,9 +242,11 @@ fn wire_chat(window: &AppWindow, cmd_tx: &UnboundedSender<Command>) {
     window.on_send_text(move |t| {
         let _ = tx.send(Command::Text(t.trim().to_string()));
     });
-    let tx = cmd_tx.clone();
+    let (tx, weak) = (cmd_tx.clone(), window.as_weak());
     window.on_talk(move || {
-        let _ = tx.send(Command::Talk);
+        if let Some(w) = weak.upgrade() {
+            talk_or_stop(&w, &tx);
+        }
     });
     let tx = cmd_tx.clone();
     window.on_toggle_listening(move |on| {
@@ -691,6 +701,15 @@ fn open_from_ball(w: &AppWindow) {
     show_window(w);
 }
 
+/// 光球 / 悬浮球“开始说话”：空闲时开始听；正在听、思考、执行或回答时停下
+fn talk_or_stop(w: &AppWindow, tx: &UnboundedSender<Command>) {
+    if (1..=4).contains(&w.get_status_code()) {
+        assistant::interrupt();
+    } else {
+        let _ = tx.send(Command::Talk);
+    }
+}
+
 fn toggle_listening(w: &AppWindow, tx: &UnboundedSender<Command>) {
     let on = !w.get_listening_enabled();
     w.set_listening_enabled(on);
@@ -731,9 +750,7 @@ fn on_ball_event(w: &AppWindow, tx: &UnboundedSender<Command>, event: ball::Ball
     use ball::BallEvent;
     match event {
         BallEvent::Open => open_from_ball(w),
-        BallEvent::Talk => {
-            let _ = tx.send(Command::Talk);
-        }
+        BallEvent::Talk => talk_or_stop(w, tx),
         BallEvent::ToggleListening => toggle_listening(w, tx),
         BallEvent::Hide => set_float_ball(w, false),
         BallEvent::Quit => {

@@ -954,10 +954,11 @@ export component AppWindow inherits Window {
         }
     }
 
-    property <string> orb-caption: root.status-code == 1 ? "正在听…"
-        : root.status-code == 2 ? "思考中…"
-        : root.status-code == 3 ? "正在操作…"
-        : root.status-code == 4 ? "正在回答…"
+    // 工作中点光球会停下，提示里说清楚
+    property <string> orb-caption: root.status-code == 1 ? "正在听 · 点按停止"
+        : root.status-code == 2 ? "思考中 · 点按停止"
+        : root.status-code == 3 ? "正在操作 · 点按停止"
+        : root.status-code == 4 ? "正在回答 · 点按停止"
         : root.status-code == 5 ? "语音唤醒已暂停，点按说话"
         : "点按说话";
 

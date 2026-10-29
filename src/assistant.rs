@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::agent::{Agent, FRONT_PROMPT};
@@ -32,6 +33,8 @@ pub enum Command {
     /// 界面上输入的文字命令
     Text(String),
     SetListening(bool),
+    /// 麦克风断开、默认麦克风换了，或者指定的麦克风重新插上了（来自耳朵线程）
+    MicChanged,
     ClearHistory,
     Reload(Config),
 }
@@ -65,6 +68,17 @@ pub enum UiEvent {
 
 pub type UiSink = Arc<dyn Fn(UiEvent) + Send + Sync>;
 
+/// 界面上点了“停止”：正在听、思考、执行或回答时立刻停下，回到待机。
+/// 只唤醒正在等待的地方，不留“许可”，所以不会误伤下一轮对话。
+static INTERRUPT: Notify = Notify::const_new();
+
+pub fn interrupt() {
+    INTERRUPT.notify_waiters();
+}
+
+/// 麦克风不可用时多久重试一次
+const MIC_RETRY: Duration = Duration::from_secs(5);
+
 /// 实时对话里，唤醒后多久没开口就结束；回复完多久没再说话就结束
 const REALTIME_FOLLOW_UP: Duration = Duration::from_secs(8);
 /// 播报结束后再等一会儿才重新收音，避免扬声器余音被当成用户说话
@@ -86,6 +100,10 @@ struct Assistant {
     audio_tx: UnboundedSender<Vec<f32>>,
     audio_rx: UnboundedReceiver<Vec<f32>>,
     listening: bool,
+    /// 这一轮被用户点了停止，不要再接着听
+    stopped: bool,
+    /// 上次打开麦克风失败是因为没有可用的麦克风（定时重试）
+    mic_missing: bool,
 }
 
 pub async fn run(cfg: Config, mut rx: UnboundedReceiver<Command>, cmd_tx: UnboundedSender<Command>, ui: UiSink) {
@@ -100,6 +118,8 @@ pub async fn run(cfg: Config, mut rx: UnboundedReceiver<Command>, cmd_tx: Unboun
     let mut a = Assistant {
         front_tools: Arc::new(Tools::local_only(apps.clone())), // 马上由 apply_config 换成正式的
         listening: cfg.listen_on_start,
+        stopped: false,
+        mic_missing: false,
         agent: None,
         cfg,
         ui,
@@ -113,10 +133,14 @@ pub async fn run(cfg: Config, mut rx: UnboundedReceiver<Command>, cmd_tx: Unboun
         audio_rx,
     };
     a.apply_config();
-    a.restart_ear();
+    if let Err(e) = a.restart_ear() {
+        a.chat(Role::System, format!("语音唤醒不可用：{e:#}"));
+    }
     a.go_idle();
+    let mut mic_retry = tokio::time::interval(MIC_RETRY);
 
     loop {
+        a.stopped = false;
         tokio::select! {
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { break };
@@ -142,6 +166,16 @@ pub async fn run(cfg: Config, mut rx: UnboundedReceiver<Command>, cmd_tx: Unboun
                         a.listening = on;
                         a.go_idle();
                     }
+                    Command::MicChanged => {
+                        let was_ok = a.ear.is_some();
+                        a.ear = None; // 先释放旧的
+                        match a.restart_ear() {
+                            Ok(name) if !was_ok => a.chat(Role::System, format!("麦克风已恢复：{name}")),
+                            Ok(_) => {}
+                            Err(_) => a.chat(Role::System, "麦克风断开了，重新接上后会自动恢复；现在可以打字使用。"),
+                        }
+                        a.go_idle();
+                    }
                     Command::ClearHistory => {
                         if let Some(agent) = a.agent.as_mut() {
                             agent.clear();
@@ -153,6 +187,12 @@ pub async fn run(cfg: Config, mut rx: UnboundedReceiver<Command>, cmd_tx: Unboun
             done = a.done_rx.recv() => {
                 if let Some(done) = done {
                     a.announce(done).await;
+                }
+            }
+            _ = mic_retry.tick(), if a.ear.is_none() && a.mic_missing => {
+                if let Ok(name) = a.restart_ear() {
+                    a.chat(Role::System, format!("麦克风已恢复：{name}"));
+                    a.go_idle();
                 }
             }
         }
@@ -206,7 +246,8 @@ impl Assistant {
         }
     }
 
-    fn restart_ear(&mut self) {
+    /// 重新打开麦克风，返回设备名
+    fn restart_ear(&mut self) -> anyhow::Result<String> {
         self.ear = None; // 先释放旧的麦克风
         let settings = EarSettings {
             device: self.cfg.input_device.clone(),
@@ -219,14 +260,16 @@ impl Assistant {
         match audio::start_ear(settings, mode, self.cmd_tx.clone(), self.audio_tx.clone()) {
             Ok((ear, name, problems)) => {
                 self.ear = Some(ear);
-                self.emit(UiEvent::Mic(name));
+                self.emit(UiEvent::Mic(name.clone()));
                 for p in problems {
                     self.chat(Role::System, format!("唤醒词问题：{p}"));
                 }
+                Ok(name)
             }
             Err(e) => {
+                self.mic_missing = audio::is_mic_unavailable(&e);
                 self.emit(UiEvent::Mic("麦克风不可用".into()));
-                self.chat(Role::System, format!("语音唤醒不可用：{e}"));
+                Err(e)
             }
         }
     }
@@ -239,7 +282,9 @@ impl Assistant {
         self.cfg = new_cfg;
         self.apply_config();
         if ear_changed {
-            self.restart_ear();
+            if let Err(e) = self.restart_ear() {
+                self.chat(Role::System, format!("语音唤醒不可用：{e:#}"));
+            }
         }
         self.go_idle();
     }
@@ -290,6 +335,9 @@ impl Assistant {
         let mut next = self.listen(beep).await;
         while let Some(text) = next.take() {
             let barged = self.handle(&text).await;
+            if self.stopped {
+                break;
+            }
             if barged || (self.cfg.follow_up && self.listening) {
                 next = self.listen(barged).await;
             }
@@ -319,7 +367,13 @@ impl Assistant {
             speech_timeout: Duration::from_secs(self.cfg.asr_speech_timeout_secs),
         };
         let ui = self.ui.clone();
-        let result = asr::recognize(&settings, &mut self.audio_rx, |partial| ui(UiEvent::Partial(partial.to_string()))).await;
+        let result = tokio::select! {
+            r = asr::recognize(&settings, &mut self.audio_rx, |partial| ui(UiEvent::Partial(partial.to_string()))) => r,
+            _ = INTERRUPT.notified() => {
+                self.stopped = true;
+                Ok(None)
+            }
+        };
         self.set_mode(MODE_MUTED);
         while self.audio_rx.try_recv().is_ok() {}
         self.emit(UiEvent::Partial(String::new()));
@@ -348,11 +402,22 @@ impl Assistant {
                     ui(UiEvent::Chat(Role::Tool, text));
                 }
             };
-            match agent.ask(text, on_tool).await {
-                Ok(r) => r,
-                Err(e) => {
+            let result = tokio::select! {
+                r = agent.ask(text, on_tool) => Some(r),
+                _ = INTERRUPT.notified() => None,
+            };
+            match result {
+                Some(Ok(r)) => r,
+                Some(Err(e)) => {
                     (self.ui)(UiEvent::Chat(Role::System, format!("{e:#}")));
                     format!("这次没能确认完成：{e}。")
+                }
+                None => {
+                    // 中途停下时对话历史可能不完整（有工具调用没有结果），丢掉以免下一轮出错
+                    agent.clear();
+                    self.stopped = true;
+                    self.chat(Role::System, "（已停止）");
+                    return false;
                 }
             }
         } else {
@@ -364,7 +429,7 @@ impl Assistant {
     }
 
     /// 系统播报。开启打断时播报期间仍听唤醒词，听到就停下并返回 true（这时已经在录音）
-    async fn speak(&self, text: &str) -> bool {
+    async fn speak(&mut self, text: &str) -> bool {
         self.emit(UiEvent::Status(Status::Speaking));
         let barge = self.cfg.barge_in && self.ear.is_some() && self.listening;
         self.set_mode(if barge { MODE_BARGE } else { MODE_MUTED });
@@ -374,6 +439,12 @@ impl Assistant {
         loop {
             tokio::select! {
                 _ = &mut speaking => break,
+                _ = INTERRUPT.notified() => {
+                    self.tts.stop();
+                    (&mut speaking).await;
+                    self.stopped = true;
+                    break;
+                }
                 _ = async { notify.as_ref().unwrap().notified().await }, if barge => {
                     if self.mode() == MODE_CAPTURE {
                         self.tts.stop();
@@ -445,6 +516,13 @@ impl Assistant {
 
         loop {
             tokio::select! {
+                _ = INTERRUPT.notified() => {
+                    player.clear();
+                    if responding {
+                        session.cancel_response().await;
+                    }
+                    break;
+                }
                 chunk = self.audio_rx.recv() => {
                     if let Some(chunk) = chunk {
                         if self.mode() == MODE_CAPTURE {

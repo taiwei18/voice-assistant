@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -49,10 +49,26 @@ fn pick_device(hint: &str) -> anyhow::Result<cpal::Device> {
     host.default_input_device().ok_or_else(|| anyhow!("没有找到麦克风"))
 }
 
+fn device_name(device: &cpal::Device) -> String {
+    device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "未知设备".into())
+}
+
+/// 正在用的麦克风是不是已经不是该用的那个了：
+/// 用系统默认时，默认设备换了（插上耳机）；指定了设备但当时没插、用了默认的，现在指定的又插上了。
+fn should_switch(hint: &str, current: &str) -> bool {
+    let host = cpal::default_host();
+    if hint.is_empty() {
+        return host.default_input_device().is_some_and(|d| device_name(&d) != current);
+    }
+    let hint = hint.to_lowercase();
+    !current.to_lowercase().contains(&hint)
+        && host.input_devices().is_ok_and(|mut ds| ds.any(|d| device_name(&d).to_lowercase().contains(&hint)))
+}
+
 /// 打开麦克风，回调里转成单声道 f32 发到 tx。返回（流，采样率，设备名）。
 fn open_mic(hint: &str, tx: mpsc::Sender<Vec<f32>>) -> anyhow::Result<(cpal::Stream, u32, String)> {
     let device = pick_device(hint)?;
-    let name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "未知设备".into());
+    let name = device_name(&device);
     let supported = device.default_input_config().context("读取麦克风格式失败")?;
     let channels = supported.channels() as usize;
     let rate = supported.sample_rate();
@@ -148,6 +164,25 @@ pub struct EarSettings {
     pub model_dir: PathBuf,
 }
 
+/// 打不开麦克风（没插、被占用、格式不支持）；和唤醒词模型的问题区分开，只有这种才值得定时重试
+#[derive(Debug)]
+pub struct MicUnavailable;
+
+impl std::fmt::Display for MicUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("麦克风不可用")
+    }
+}
+
+pub fn is_mic_unavailable(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<MicUnavailable>().is_some()
+}
+
+/// 多久没收到音频就认为麦克风断开了
+const SILENT_DEVICE_TIMEOUT: Duration = Duration::from_secs(3);
+/// 多久检查一次该用的麦克风有没有变化
+const DEVICE_CHECK_EVERY: Duration = Duration::from_secs(5);
+
 /// 后台“耳朵”线程的句柄；drop 时停止线程并释放麦克风
 pub struct Ear {
     pub mode: Arc<AtomicU8>,
@@ -201,17 +236,34 @@ pub fn start_ear(
             let (_stream, rate, name) = match open_mic(&settings.device, raw_tx) {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = ready_tx.send(Err(e));
+                    let _ = ready_tx.send(Err(e.context(MicUnavailable)));
                     return;
                 }
             };
-            let _ = ready_tx.send(Ok((name, problems)));
+            let _ = ready_tx.send(Ok((name.clone(), problems)));
 
             let mut resampler = Resampler::new(rate);
             let mut gate = EnergyGate::new();
             let mut last_mode = u8::MAX;
+            // 正常的麦克风即使安静也会持续回调；几秒没有数据说明设备被拔掉或出错了
+            let mut last_audio = Instant::now();
+            let mut last_device_check = Instant::now();
             while !stop2.load(Ordering::SeqCst) {
-                let Ok(chunk) = raw_rx.recv_timeout(Duration::from_millis(200)) else { continue };
+                if last_device_check.elapsed() > DEVICE_CHECK_EVERY {
+                    last_device_check = Instant::now();
+                    if should_switch(&settings.device, &name) {
+                        let _ = events.send(Command::MicChanged);
+                        return;
+                    }
+                }
+                let Ok(chunk) = raw_rx.recv_timeout(Duration::from_millis(200)) else {
+                    if last_audio.elapsed() > SILENT_DEVICE_TIMEOUT {
+                        let _ = events.send(Command::MicChanged);
+                        return;
+                    }
+                    continue;
+                };
+                last_audio = Instant::now();
                 let samples = resampler.process(&chunk);
                 let current = mode2.load(Ordering::SeqCst);
                 if current == MODE_IDLE || current == MODE_BARGE {
@@ -242,6 +294,6 @@ pub fn start_ear(
     match ready_rx.recv_timeout(Duration::from_secs(15)) {
         Ok(Ok((name, problems))) => Ok((Ear { mode, barge, stop, thread: Some(thread) }, name, problems)),
         Ok(Err(e)) => Err(e),
-        Err(_) => Err(anyhow!("启动麦克风超时")),
+        Err(_) => Err(anyhow!("启动麦克风超时").context(MicUnavailable)),
     }
 }
