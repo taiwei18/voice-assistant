@@ -1,6 +1,7 @@
-//! 工具注册表。两套：
-//! - 前台：一步就能完成的本地工具 + 后台任务（开始 / 进度 / 取消），给对话用，要快；
-//! - 全套：本地工具 + 桌面控制 + 浏览器控制，给内置后台助手用，也通过 MCP 提供给 Codex / Claude Code。
+//! 工具注册表：本地工具 + 桌面控制 + 浏览器控制。
+//! - 前台对话用全套工具再加上后台任务（开始 / 进度 / 取消）：几步能做完的自己做，耗时长的才交出去；
+//! - 内置后台助手和 MCP（给 Codex / Claude Code）用全套工具，不带后台任务工具。
+//! 前台和内置后台助手共用同一个桌面控制线程和浏览器会话。
 
 pub mod apps;
 pub mod browser;
@@ -16,7 +17,7 @@ use crate::tasks::TaskManager;
 
 pub struct Tools {
     pub apps: Arc<apps::AppIndex>,
-    desktop: Option<desktop::Desktop>,
+    desktop: Option<Arc<desktop::Desktop>>,
     browser: Option<Arc<browser::Browser>>,
     tasks: Option<Arc<TaskManager>>,
 }
@@ -26,20 +27,25 @@ impl Tools {
     pub fn new(cfg: &Config, apps: Arc<apps::AppIndex>) -> Self {
         Self {
             apps,
-            desktop: cfg.desktop_control.then(desktop::Desktop::new),
+            desktop: cfg.desktop_control.then(|| Arc::new(desktop::Desktop::new())),
             browser: cfg.browser_control.then(|| browser::Browser::new(&cfg.playwright_mcp, cfg.browser_idle_minutes)),
             tasks: None,
         }
     }
 
-    /// 前台工具：快速本地工具 + 后台任务
-    pub fn front(apps: Arc<apps::AppIndex>, tasks: Arc<TaskManager>) -> Self {
-        Self { apps, desktop: None, browser: None, tasks: Some(tasks) }
+    /// 只有本地工具（启动时占位用）
+    pub fn local_only(apps: Arc<apps::AppIndex>) -> Self {
+        Self { apps, desktop: None, browser: None, tasks: None }
     }
 
-    /// 只要桌面相关的工具（MCP 模式给外部智能体用，浏览器它们自己有）
-    pub fn desktop_only(apps: Arc<apps::AppIndex>) -> Self {
-        Self { apps, desktop: Some(desktop::Desktop::new()), browser: None, tasks: None }
+    /// 前台工具：同一套工具再加上后台任务
+    pub fn with_tasks(&self, tasks: Arc<TaskManager>) -> Self {
+        Self { apps: self.apps.clone(), desktop: self.desktop.clone(), browser: self.browser.clone(), tasks: Some(tasks) }
+    }
+
+    /// MCP 模式给外部智能体用：全套工具（桌面 + 浏览器，按设置里的开关），但没有后台任务工具
+    pub fn for_agents(cfg: &Config, apps: Arc<apps::AppIndex>) -> Self {
+        Self::new(cfg, apps)
     }
 
     pub fn definitions(&self) -> Vec<Value> {
@@ -62,6 +68,7 @@ impl Tools {
         if let Some(tasks) = &self.tasks {
             match name {
                 "start_task" => return tasks.start(input["task"].as_str().unwrap_or("")),
+                "resume_task" => return tasks.resume(input["id"].as_u64().and_then(|id| u32::try_from(id).ok()), input["instruction"].as_str().unwrap_or("")),
                 "task_status" => return (tasks.status(), false),
                 "cancel_task" => return tasks.cancel(input["id"].as_u64().map(|i| i as u32)),
                 _ => {}
@@ -95,6 +102,11 @@ impl Tools {
 
 fn task_definitions() -> Vec<Value> {
     vec![
+        json!({
+            "name": "resume_task",
+            "description": "继续、重试或修改已结束的后台任务，自动带上原任务和完整结果。不填 id 时使用最近任务。用户说接着做、修改刚才结果时优先使用。运行中的任务须先取消。",
+            "input_schema": {"type": "object", "properties": {"id": {"type": "integer", "minimum": 1}, "instruction": {"type": "string"}}, "required": ["instruction"]}
+        }),
         json!({
             "name": "start_task",
             "description": "把需要多步操作的任务交给后台智能体去做（操作软件或网页、查资料并总结、读写文件、整理东西等），立即返回，不用等它做完。task 要写成完整、独立能看懂的说明，包含用户的原话要点。",

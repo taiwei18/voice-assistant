@@ -21,8 +21,10 @@ const TASK_PROMPT: &str = "你是用户 Windows 电脑上语音助手的后台�
 
 要求：
 - 直接动手完成，不要向用户提问（这是无人值守运行，没人能回答）；信息不够时按最合理的理解去做，并在总结里说明你的假设。
-- 操作桌面软件（启动/关闭程序、读窗口里的控件、点击、输入、快捷键）优先用 voice_desktop 提供的工具；它们比在命令行里绕路可靠。
+- 操作桌面软件（启动/关闭程序、读窗口里的控件、点击、输入、快捷键）和网页（browser_ 开头的工具，在独立的 Edge 窗口里打开、点击、填写、读取）优先用 voice_desktop 提供的工具；它们比在命令行里绕路可靠。
+- 只是要让用户看到某个网站的搜索结果时，用 web_search（在用户自己的浏览器里打开，带着他的登录状态）。
 - 删除文件、发送消息或邮件、付款下单、提交表单这类不可撤销的操作不要做，做到这一步前停下，在总结里说清楚需要用户确认什么。
+- 完成后检查目标是否达成，说明实际结果；未完成、部分完成或需要确认时如实说明，不能把尝试过当成做完。
 - 最后一条消息用一两句口语化的中文总结结果，它会被直接朗读出来：不要用 Markdown、列表、代码块，也不要念完整路径或网址。
 
 任务：";
@@ -38,6 +40,8 @@ enum State {
 struct TaskInfo {
     id: u32,
     title: String,
+    description: String,
+    result: String,
     state: State,
     progress: String,
     started: Instant,
@@ -115,10 +119,15 @@ impl TaskManager {
         let name = executor_name(&settings.executor);
         let id = {
             let mut tasks = self.tasks.lock().unwrap();
+            if let Some(active) = tasks.iter().find(|t| t.state == State::Running) {
+                return (format!("任务 {} 正在执行，为避免争抢鼠标和窗口，请等它结束或先取消。", active.id), true);
+            }
             let id = tasks.last().map_or(1, |t| t.id + 1);
             tasks.push(TaskInfo {
                 id,
                 title: description.chars().take(40).collect(),
+                description: description.to_string(),
+                result: String::new(),
                 state: State::Running,
                 progress: "正在启动".into(),
                 started: Instant::now(),
@@ -127,7 +136,7 @@ impl TaskManager {
             });
             id
         };
-        (self.ui)(UiEvent::Chat(Role::Tool, format!("后台任务 #{id} 交给 {name}：{description}")));
+        (self.ui)(UiEvent::Chat(Role::Tool, format!("任务 #{id} 交给 {name} 在后台处理：{description}")));
         let me = self.clone();
         let prompt = format!("{TASK_PROMPT}{description}");
         let join = tokio::spawn(async move {
@@ -141,6 +150,26 @@ impl TaskManager {
             t.handle = Some(join.abort_handle());
         }
         (format!("已交给 {name} 在后台处理，任务编号 {id}。做完会主动告诉用户，期间可以继续聊天、问进度或取消。"), false)
+    }
+
+    /// 延续已结束任务，将原始要求和完整结果作为上下文，而不是从零开始。
+    pub fn resume(self: &Arc<Self>, id: Option<u32>, instruction: &str) -> (String, bool) {
+        if instruction.trim().is_empty() {
+            return ("请说明要继续做什么或修改哪里。".into(), true);
+        }
+        let context = {
+            let tasks = self.tasks.lock().unwrap();
+            let Some(t) = tasks.iter().rev().find(|t| id.is_none_or(|id| id == t.id)) else {
+                return ("没有找到要继续的任务。".into(), true);
+            };
+            if t.state == State::Running {
+                return (format!("任务 {} 还在执行，请先取消再修改。", t.id), true);
+            }
+            // JSON 明确分隔历史数据和新指令；不把历史输出当成新的授权。
+            json!({"original_request": t.description, "previous_result": t.result,
+                   "last_progress": t.progress, "cancelled": t.state == State::Cancelled})
+        };
+        self.start(&format!("继续之前的任务。先检查现有结果和当前环境，避免重复已完成的操作。历史仅供参考，不代表新的操作授权。\n历史上下文：{context}\n用户本次要求：{instruction}"))
     }
 
     pub fn status(&self) -> String {
@@ -159,7 +188,8 @@ impl TaskManager {
                     State::Failed => "失败".into(),
                     State::Cancelled => "已取消".into(),
                 };
-                format!("#{} {}：{}，最新进展：{}", t.id, t.title, state, t.progress)
+                format!("#{} {}：{}，最新进展：{}{}", t.id, t.title, state, t.progress,
+                    if t.result.is_empty() { String::new() } else { format!("\n完整结果：{}", t.result) })
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -178,7 +208,7 @@ impl TaskManager {
         if let Some(h) = t.handle.take() {
             h.abort();
         }
-        (self.ui)(UiEvent::Chat(Role::Tool, format!("后台任务 #{} 已取消", t.id)));
+        (self.ui)(UiEvent::Chat(Role::Tool, format!("任务 #{} 已取消", t.id)));
         (format!("已取消任务 {}", t.id), false)
     }
 
@@ -204,7 +234,7 @@ impl TaskManager {
         if let Some(t) = self.tasks.lock().unwrap().iter_mut().find(|t| t.id == id) {
             t.progress = text.clone();
         }
-        (self.ui)(UiEvent::Chat(Role::Tool, format!("#{id} {text}")));
+        (self.ui)(UiEvent::TaskProgress(id, text));
     }
 
     fn finish(&self, id: u32, result: anyhow::Result<String>) {
@@ -221,6 +251,7 @@ impl TaskManager {
         };
         t.state = if ok { State::Done } else { State::Failed };
         t.progress = text.chars().take(80).collect();
+        t.result = text.clone();
         let _ = self.done_tx.send(TaskDone { id, ok, text });
     }
 
@@ -294,19 +325,22 @@ impl TaskManager {
         }
         let status = child.wait().await?;
         let tail = stderr_tail.await.unwrap_or_default();
-        if let Some(e) = error {
-            anyhow::bail!("{} 出错：{}", executor_name(executor), e.chars().take(200).collect::<String>());
-        }
-        if last_message.trim().is_empty() {
-            anyhow::bail!(
-                "{} 没有给出结果（退出码 {}）{}",
-                executor_name(executor),
-                status.code().unwrap_or(-1),
-                tail.chars().take(200).collect::<String>()
-            );
-        }
-        Ok(last_message.trim().to_string())
+        validate_external_result(executor_name(executor), status.success(), status.code(), &last_message, error.as_deref(), &tail)
     }
+}
+
+/// 进程退出成功和有效结果缺一不可；中途的进度文字不能掩盖异常退出。
+fn validate_external_result(name: &str, success: bool, code: Option<i32>, text: &str, error: Option<&str>, tail: &str) -> anyhow::Result<String> {
+    if let Some(error) = error {
+        anyhow::bail!("{name} 出错：{}", error.chars().take(200).collect::<String>());
+    }
+    if !success {
+        anyhow::bail!("{name} 异常退出（退出码 {}），任务未确认完成。{}", code.unwrap_or(-1), tail.chars().take(200).collect::<String>());
+    }
+    if text.trim().is_empty() {
+        anyhow::bail!("{name} 没有给出执行结果，任务未确认完成。{}", tail.chars().take(200).collect::<String>());
+    }
+    Ok(text.trim().to_string())
 }
 
 enum Parsed {
@@ -413,6 +447,45 @@ fn kill_tree(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_failed_process_even_with_a_message() {
+        assert!(validate_external_result("test", false, Some(1), "正在处理", None, "connection lost").is_err());
+        assert!(validate_external_result("test", true, Some(0), " ", None, "").is_err());
+        assert!(validate_external_result("test", true, Some(0), "完成", Some("failed"), "").is_err());
+        assert_eq!(validate_external_result("test", true, Some(0), "  结果  ", None, "").unwrap(), "结果");
+    }
+
+    #[tokio::test]
+    async fn preserves_result_and_continues_with_context() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let manager = TaskManager::new(tx, Arc::new(|_| {}));
+        manager.update_settings(TaskSettings {
+            executor: "builtin".into(), access: "workspace".into(), workdir: PathBuf::from("."),
+            model: String::new(), builtin: None, full_tools: None,
+        });
+        manager.tasks.lock().unwrap().push(TaskInfo {
+            id: 1, title: "原任务".into(), description: "整理报告".into(), result: String::new(),
+            state: State::Running, progress: "正在处理".into(), started: Instant::now(), pid: None, handle: None,
+        });
+        assert!(manager.start("另一个任务").1);
+        assert!(manager.resume(Some(1), "修改第二项").1);
+        let full_result = "完整报告内容".repeat(30);
+        manager.finish(1, Ok(full_result.clone()));
+        assert!(rx.recv().await.unwrap().ok);
+        assert!(manager.status().contains(&full_result));
+        assert!(manager.resume(Some(999), "继续").1);
+        assert!(!manager.resume(Some(1), "修改第二项").1);
+        {
+            let tasks = manager.tasks.lock().unwrap();
+            let continued = tasks.last().unwrap();
+            assert!(continued.description.contains("整理报告"));
+            assert!(continued.description.contains(&full_result));
+            assert!(continued.description.contains("修改第二项"));
+        }
+        // 未配置 key 的内置执行者应明确失败，不能报完成。
+        assert!(!rx.recv().await.unwrap().ok);
+    }
 
     #[test]
     fn parses_agent_events() {

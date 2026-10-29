@@ -1,10 +1,10 @@
-# AI 语音助手（Rust 轻量版）
+# VOA 语音助手
 
-托盘常驻的 Windows 语音助手：前台用实时语音和你对话，简单的事（开关程序、搜索、音量）自己一步做完，复杂的事交给后台智能体（默认 Codex，可选 Claude Code 或内置 DeepSeek）去做，做完主动告诉你；期间可以接着聊天、问进度或取消。
+托盘常驻的 Windows 语音助手：前台用实时语音和你对话，几步能做完的事（开关程序、在抖音/B 站等网站搜索、操作桌面软件和网页）自己马上做，明显费时的事才交给后台智能体（默认 Codex，可选 Claude Code 或内置 DeepSeek）去做，做完主动告诉你；期间可以接着聊天、问进度或取消。
 
 ## 实测占用（发布版，待机监听）
 
-| 项目 | Rust 版 | 之前的 Python 原型 |
+| 项目 | 现在（Rust） | 早期 Python 原型（已移除） |
 |---|---|---|
 | 内存（私有） | 约 45 MB（只显示悬浮球时，接入后台智能体之前测的） | 约 1.46 GB |
 | CPU | 稳定后单核约 0.2%（同上；对话进行中会高一些） | 安静时低，有人说话时每句都跑完整识别 |
@@ -18,8 +18,8 @@
   - 拖动：可以放到任意位置，靠近屏幕左右边缘会自动吸附，位置会记住。
   - 右键：打开主界面 / 开始说话 / 暂停或恢复语音唤醒 / 隐藏悬浮球 / 退出。
   - 悬浮球不抢焦点、不出现在任务栏和 Alt+Tab 里；动画只在工作时运行，待机不重绘。隐藏后可以从托盘菜单“显示悬浮球”找回来。
-- **对话页**：底部中间的“聆听光球”是主按钮，也是状态灯——待机是带淡光晕的白色、正在听时变亮并向外扩散波纹、思考/执行时三个点依次亮起、播报时外圈呼吸、暂停唤醒时变灰。动画只在工作时运行，待机不耗 CPU。你说的话是浅色气泡，助手的回答像正文一样排版，工具调用是灰色小条；没有对话时显示几个可以直接点的示例命令。左下角是语音唤醒开关，右下角可以展开打字输入框。
-- **设置页**：右上角的滑杆图标进入，分组卡片 + 开关/步进器/分段选择/下拉框，“保存并应用”固定在底部。
+- **对话页**：底部中间的“聆听光球”是主按钮，也是状态灯——待机是带淡光晕的白色、正在听时变亮并向外扩散波纹、思考/执行时三个点依次亮起、播报时外圈呼吸、暂停唤醒时变灰。动画只在工作时运行，待机不耗 CPU。你说的话是浅色气泡，助手的回答像正文一样排版，工具调用是灰色小条（写成“打开应用：计算器”这样的人话，后台任务的进展只占一行、原地更新）；没有对话时显示几个可以直接点的示例命令。左下角是语音唤醒开关，右下角可以展开打字输入框。
+- **设置页**：右上角的滑杆图标进入，分组卡片 + 开关/步进器/分段选择/下拉框，“保存并应用”固定在底部。改了没保存时底栏会提示；直接点返回会先问“保存还是放弃”，不会悄悄丢掉或留下没生效的改动。
 - **外观**：设置里可选跟随系统、浅色、深色；Windows 11 上标题栏会和界面背景同色。
 - 界面全部是自绘组件（`ui/app.slint`），颜色集中在 `Theme` 全局里：一种强调色（“聆听光”）只用来表示助手正在工作，其余都是中性色。
 
@@ -34,12 +34,12 @@
    识别 + 大模型：fun-asr 识别一句话 → 本地直达规则 / DeepSeek → Windows SAPI 播报
                                               │ 前台工具
           ┌───────────────────────────────────┴────────────────────────┐
-   一步完成的本地工具                                         start_task / task_status / cancel_task
-   启动/关闭程序、搜索、时间、音量                                     │ 后台任务（不阻塞对话）
+   自己做（快）：启动/关闭程序、网站搜索、                    start_task / task_status / cancel_task
+   时间、音量、桌面控制、浏览器控制                                     │ 只有费时的才交出去（不阻塞对话）
                                                                       ▼
                                         Codex（codex exec）/ Claude Code（claude -p）/ 内置 DeepSeek
-                                        └─ 通过 MCP 使用本程序的桌面工具（voice-assistant.exe --mcp）：
-                                           启动/关闭程序、UI Automation 读控件、点击、输入、快捷键
+                                        └─ 通过 MCP 使用本程序的工具（voa.exe --mcp）：
+                                           启动/关闭程序、UI Automation 读控件、点击、输入、快捷键、浏览器控制
                                                                       │ 做完
                                                                       ▼
                                                         前台主动播报结果，可以接着追问
@@ -60,7 +60,7 @@
 | `src/kws.rs` | 唤醒词检测，中文唤醒词自动转拼音 token，可随时修改 |
 | `src/asr.rs` | fun-asr-realtime WebSocket 客户端 |
 | `src/llm.rs` / `src/agent.rs` | DeepSeek（Anthropic 兼容接口）和工具调用循环，分前台（对话）和后台（内置执行者）两种 |
-| `src/fastpath.rs` | 不经过大模型的常用命令 |
+| `src/fastpath.rs` | 不经过大模型的常用命令（打开/关闭程序、“打开抖音搜索 X”这类网站搜索、时间、音量） |
 | `src/tools/` | 本地工具、关闭程序（含后台进程）、桌面控制（UI Automation）、按需启动的浏览器控制 |
 | `src/tts.rs` | SAPI 播报，可中途打断 |
 | `ui/app.slint` | 界面（Slint，软件渲染，不占 GPU） |
@@ -83,20 +83,20 @@ key 用 Windows DPAPI 加密后存在配置文件里，只有当前 Windows 账�
 
 ## 编译和运行
 
-需要 Rust（`rustup`）和 VS 2022 生成工具（C++）。下面的命令在 PowerShell 或 cmd 里都能直接粘贴运行，不用先切换目录（路径按本机的 `D:\code\voice-assistant\va` 写，放在别处请相应替换）。
+需要 Rust（`rustup`）和 VS 2022 生成工具（C++）。下面的命令在 PowerShell 或 cmd 里都能直接粘贴运行，不用先切换目录（路径按本机的 `D:\code\voice-assistant` 写，放在别处请相应替换）。
 
 0. 第一次编译前下载唤醒词模型（仓库里不带，约 31 MB）：从 sherpa-onnx 的 [kws-models 发布页](https://github.com/k2-fsa/sherpa-onnx/releases/tag/kws-models) 下载 `sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2`，解压后把里面的文件放到项目的 `models\kws\` 目录。
 
 1. 编译发布版（第一次要几分钟）：
 
    ```powershell
-   powershell -ExecutionPolicy Bypass -File D:\code\voice-assistant\va\build.ps1 -Release
+   powershell -ExecutionPolicy Bypass -File D:\code\voice-assistant\build.ps1 -Release
    ```
 
-2. 编译好的程序在 `va\dist\` 里（exe、4 个 DLL 和 `models\` 都已放好），双击 `dist\voice-assistant.exe` 就能用，或者运行：
+2. 编译好的程序在 `dist\` 里（exe、4 个 DLL 和 `models\` 都已放好），双击 `dist\voa.exe` 就能用，或者运行：
 
    ```powershell
-   D:\code\voice-assistant\va\dist\voice-assistant.exe
+   D:\code\voice-assistant\dist\voa.exe
    ```
 
 3. 想开机自动启动：在设置页打开“开机自动启动”，点“保存并应用”。
@@ -108,8 +108,8 @@ key 用 Windows DPAPI 加密后存在配置文件里，只有当前 Windows 账�
 - 开机自启写的是当前用户的注册表启动项（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，不需要管理员权限），登记的是正在运行的 exe 的路径，所以请从 `dist\` 里的 exe 打开再设置；之后如果把程序挪了位置，手动启动一次就会自动更新路径。开机自启时只显示悬浮球，不弹主界面。
 - 分发时把整个 `dist` 文件夹拷走即可。
 - 浏览器控制需要 Node.js（第一次使用时通过 npx 下载 Playwright MCP）。
-- 测试唤醒词：`voice-assistant.exe --kws-test a.wav b.wav`。
-- 运行单元测试：`powershell -ExecutionPolicy Bypass -File D:\code\voice-assistant\va\build.ps1 -Test`。
+- 测试唤醒词：`voa.exe --kws-test a.wav b.wav`。
+- 运行单元测试：`powershell -ExecutionPolicy Bypass -File D:\code\voice-assistant\build.ps1 -Test`。
 
 ## 设置
 
@@ -150,4 +150,16 @@ key 用 Windows DPAPI 加密后存在配置文件里，只有当前 Windows 账�
 - 悬浮球只在单显示器上测过；多显示器、各屏缩放比例不同的情况还没测。
 - 实时语音模式下，直达规则不生效（模型边听边回，来不及先走本地规则），开关程序这类事由模型调用工具完成；打字输入仍走“识别+大模型”那一套。
 - 说唤醒词打断播报：打断后停止的机制测过（系统播报 0.1 秒内停下），但“播报时真人喊唤醒词”只能靠你实际试；外放音量很大时可能听不清唤醒词。
-- 后台任务没有跨任务的记忆，每个任务都是新会话。
+- 后台任务在本次运行期间保留原始要求和完整结果；可以说“继续上一个任务，修改第二项”或“重试任务 2”。继续时会创建带历史上下文的新任务；重启程序后不保留任务历史。一次只运行一个后台任务，避免争抢窗口。
+- 异常退出、空回复和超过步骤上限都会明确报错；后台返回文字只表示拿到结果，不代表所有操作已经验证成功。
+- 浏览器控制（Playwright）用的是独立的 Edge 窗口，没有你的登录状态；第一次用要启动 Edge，会慢几秒。“在抖音/B 站/小红书/淘宝/京东/知乎/YouTube/GitHub 搜 X”不走浏览器控制，直接在你自己的浏览器里打开搜索结果。
+
+## 安装与更新
+
+首次运行 `powershell -ExecutionPolicy Bypass -File D:\code\voice-assistant\install.ps1 -Launch`，安装到当前用户的 `%LOCALAPPDATA%\Programs\VoiceAssistant`，不需要管理员权限。桌面和开始菜单会出现“VOA”，Windows“已安装的应用”中可以卸载。设置和 API Key 仍保存在原位置，更新及卸载均保留。
+
+安装后，每次 `build.ps1 -Release` 会自动更新并启动安装版。更新时会停止旧版本，请先等正在执行的任务结束。也可以单独重新运行 `install.ps1` 更新已有发布文件。这是本机编译更新流程，尚未接入在线更新服务。
+
+## 应用图标
+
+品牌源文件为 `assets/app.svg`，多尺寸 Windows 图标为 `assets/app.ico`；窗口、托盘与 exe 共用同一图形。运行 `python scripts/generate_icon.py`（需要 Pillow）重新生成 PNG、ICO 和嵌入的 RGBA 数据，再运行 `build.ps1 -Release` 更新安装版。

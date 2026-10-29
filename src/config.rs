@@ -262,6 +262,11 @@ pub fn asr_key(cfg: &Config) -> Option<String> {
 }
 
 /// 给界面显示的 key 状态（不显示 key 本身）
+/// 界面里保存过 key（不算环境变量）
+pub fn has_saved_key(protected: &str) -> bool {
+    unprotect_key(protected).is_some()
+}
+
 pub fn key_status(protected: &str, env_name: &str) -> String {
     if unprotect_key(protected).is_some() {
         "已保存（加密存放在本机）".into()

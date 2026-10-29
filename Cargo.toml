@@ -1,8 +1,8 @@
 [package]
-name = "voice-assistant"
+name = "voa"
 version = "0.1.0"
 edition = "2024"
-description = "轻量 AI 语音助手：唤醒词 + 云端流式识别 + DeepSeek + 桌面/浏览器控制"
+description = "VOA，轻量 AI 语音助手：唤醒词 + 云端流式识别 + DeepSeek + 桌面/浏览器控制"
 
 [dependencies]
 # unstable-winit-030：拿到原生窗口，让标题栏颜色和界面背景一致

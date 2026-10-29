@@ -148,7 +148,7 @@ impl Browser {
         session
             .request(
                 "initialize",
-                json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "voice-assistant", "version": "0.1"}}),
+                json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "voa", "version": "0.1"}}),
             )
             .await?;
         session.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await?;

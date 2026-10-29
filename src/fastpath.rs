@@ -10,6 +10,10 @@ use crate::tools::apps::{self, AppIndex, Match};
 use crate::tools::process::{self, Closed};
 
 static OPEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(?:打开|启动|运行|开一下|开)(?:一下)?(.+?)(?:一下|吧)?$").unwrap());
+// “打开抖音搜索无畏契约直播”“在B站上搜一下原神”“淘宝搜机械键盘”
+static SITE_SEARCH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:打开|在|去|用|到)?(.{1,8}?)(?:上面|里面|上|里|中)?[，, ]*(?:然后)?(?:搜索|搜一下|搜一搜|搜|查找|找一下|找)(.+)$").unwrap()
+});
 // “关闭微信”“关掉 GPT 的后台”“把网易云音乐关了”
 static CLOSE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:关闭|关掉|关了|退出|结束)(?:一下)?(.+?)(?:的?(?:后台|进程|程序))?吧?$").unwrap());
@@ -52,6 +56,16 @@ pub fn try_handle(text: &str, apps: &AppIndex) -> Option<String> {
     if let Some((key, times, reply)) = media {
         sys::press_media_key(key, times);
         return Some(reply.into());
+    }
+
+    // 要在“打开 XX”之前判断，否则“打开抖音搜索 XX”会被当成打开一个叫“抖音搜索 XX”的程序
+    if let Some(c) = SITE_SEARCH.captures(&t) {
+        if let Some(engine) = apps::site_engine(&c[1]) {
+            let query = c[2].trim().trim_start_matches(['一', '下']).trim();
+            if !query.is_empty() && sys::shell_open(&apps::search_url(query, engine)) {
+                return Some(format!("已在{}搜索{query}。", c[1].trim()));
+            }
+        }
     }
 
     if let Some(c) = CLOSE.captures(&t).or_else(|| CLOSE_BA.captures(&t)) {
@@ -102,5 +116,22 @@ mod tests {
         assert_eq!(name("把网易云音乐关了").as_deref(), Some("网易云音乐"));
         assert_eq!(name("结束ChatGPT进程").as_deref(), Some("ChatGPT"));
         assert_eq!(name("打开微信"), None);
+    }
+
+    #[test]
+    fn site_search_phrases() {
+        let parse = |text: &str| {
+            let t = normalize(text);
+            SITE_SEARCH
+                .captures(&t)
+                .and_then(|c| apps::site_engine(&c[1]).map(|e| (e, c[2].trim().trim_start_matches(['一', '下']).trim().to_string())))
+        };
+        assert_eq!(parse("打开抖音搜索无畏契约直播"), Some(("douyin", "无畏契约直播".into())));
+        assert_eq!(parse("帮我在抖音里面搜一下无畏契约直播。"), Some(("douyin", "无畏契约直播".into())));
+        assert_eq!(parse("打开抖音，然后搜索无畏契约直播"), Some(("douyin", "无畏契约直播".into())));
+        assert_eq!(parse("在B站上搜原神"), Some(("bilibili", "原神".into())));
+        assert_eq!(parse("淘宝搜机械键盘"), Some(("taobao", "机械键盘".into())));
+        assert_eq!(parse("搜索明天的天气"), None); // 没说网站，交给普通搜索
+        assert_eq!(parse("打开记事本"), None);
     }
 }

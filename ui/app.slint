@@ -169,7 +169,11 @@ component TextField inherits Rectangle {
     in property <bool> enabled: true;
     in property <length> radius: 8px;
     callback accepted(string);
+    callback escaped();
     property <bool> reveal;
+    public function focus-input() {
+        input.focus();
+    }
     height: 36px;
     border-radius: root.radius;
     background: Theme.inset;
@@ -206,6 +210,13 @@ component TextField inherits Rectangle {
                 selection-background-color: Theme.signal-soft;
                 input-type: root.password && !root.reveal ? InputType.password : InputType.text;
                 accepted => { root.accepted(self.text); }
+                key-pressed(event) => {
+                    if (event.text == Key.Escape) {
+                        root.escaped();
+                        return accept;
+                    }
+                    reject
+                }
             }
         }
         if root.password: VerticalLayout {
@@ -467,7 +478,7 @@ component KeyBadge inherits Rectangle {
             Rectangle { width: 6px; height: 6px; border-radius: 3px; background: root.tone; }
         }
         Text {
-            text: root.state == 0 ? "未设置" : root.state == 1 ? "已就绪" : root.state == 2 ? "测试中…" : root.state == 3 ? "可用" : "不可用";
+            text: root.state == 0 ? "未设置" : root.state == 1 ? "已设置" : root.state == 2 ? "测试中…" : root.state == 3 ? "测试通过" : "测试失败";
             font-size: 11px;
             font-weight: 500;
             color: root.tone;
@@ -562,9 +573,12 @@ component KeyBlock inherits VerticalLayout {
     in property <string> detail;
     in property <string> hint;
     in property <string> placeholder;
+    in property <bool> saved;
     in-out property <string> input;
     callback test();
     callback clear();
+    // 清除不可撤销：第一次点只是询问，3 秒内再点才真正清除
+    property <bool> confirm-clear;
     padding-left: 16px;
     padding-right: 16px;
     padding-top: 14px;
@@ -594,17 +608,29 @@ component KeyBlock inherits VerticalLayout {
             enabled: root.state != 2;
             clicked => { root.test(); }
         }
-        Btn {
-            text: "清除已保存的 key";
+        if root.saved: Btn {
+            text: root.confirm-clear ? "再点一次确认清除" : "清除已保存的 key";
             kind: 3;
-            clicked => { root.clear(); }
+            clicked => {
+                if (root.confirm-clear) {
+                    root.confirm-clear = false;
+                    root.clear();
+                } else {
+                    root.confirm-clear = true;
+                }
+            }
         }
         Rectangle { horizontal-stretch: 1; }
     }
-    Text {
+    Timer {
+        interval: 3s;
+        running: root.confirm-clear;
+        triggered => { root.confirm-clear = false; }
+    }
+    if root.detail != "": Text {
         text: root.detail;
         font-size: 11px;
-        color: root.state == 4 ? Theme.danger : Theme.ink-3;
+        color: root.state == 4 ? Theme.danger : root.state == 3 ? Theme.ok : Theme.ink-3;
         wrap: word-wrap;
     }
     Text {
@@ -814,7 +840,7 @@ component Orb inherits Rectangle {
 // ============================================================
 
 export component AppWindow inherits Window {
-    title: "AI 语音助手";
+    title: "VOA";
     icon: root.app-icon;
     background: Theme.canvas;
     default-font-family: "Microsoft YaHei UI";
@@ -837,6 +863,7 @@ export component AppWindow inherits Window {
     in-out property <string> llm-key-input;
     in property <string> llm-key-status;
     in property <int> llm-key-state;
+    in property <bool> llm-key-saved;
     in-out property <string> llm-base-url;
     in-out property <string> llm-model;
     in-out property <bool> llm-thinking;
@@ -846,12 +873,15 @@ export component AppWindow inherits Window {
     in-out property <string> asr-key-input;
     in property <string> asr-key-status;
     in property <int> asr-key-state;
+    in property <bool> asr-key-saved;
     in-out property <string> asr-url;
     in-out property <string> asr-model;
     in-out property <int> asr-silence-ms;
     in-out property <int> asr-timeout-secs;
     // 设置：唤醒与麦克风
     in-out property <string> wake-words;
+    // 已保存的第一个唤醒词，空状态的提示用
+    in property <string> first-wake-word: "你好电脑";
     in-out property <float> sensitivity: 0.6;
     in-out property <float> kws-score: 1.5;
     in-out property <bool> follow-up;
@@ -868,6 +898,9 @@ export component AppWindow inherits Window {
     in-out property <bool> float-ball;
     in-out property <bool> launch-at-login;
     in-out property <string> settings-note;
+    // 0 成功  1 出错  2 普通说明
+    in property <int> note-kind;
+    in property <bool> settings-dirty;
     // 后台智能体与语音对话
     in-out property <int> executor-index;
     in-out property <int> access-index;
@@ -892,14 +925,26 @@ export component AppWindow inherits Window {
     callback clear-llm-key();
     callback clear-asr-key();
     callback theme-changed();
+    callback discard-settings();
 
     // 0 对话  1 设置
-    property <int> page: 0;
+    in-out property <int> page: 0;
+    // 有未保存的更改时点了返回：底栏改成询问保存还是放弃
+    property <bool> leave-pending;
     property <bool> show-keyboard: false;
     property <string> draft;
 
     public function scroll-to-bottom() {
         chat-list.content-y = min(0px, chat-list.visible-height - chat-list.content-height);
+    }
+
+    function leave-settings() {
+        if (root.settings-dirty) {
+            root.leave-pending = true;
+        } else {
+            root.settings-note = "";
+            root.page = 0;
+        }
     }
 
     function submit() {
@@ -937,7 +982,7 @@ export component AppWindow inherits Window {
                 alignment: center;
                 spacing: 2px;
                 Text {
-                    text: "语音助手";
+                    text: "VOA";
                     font-size: 17px;
                     font-weight: 600;
                     letter-spacing: -0.2px;
@@ -950,16 +995,7 @@ export component AppWindow inherits Window {
                     overflow: elide;
                 }
             }
-            VerticalLayout {
-                alignment: center;
-                Text {
-                    text: root.memory;
-                    font-size: 11px;
-                    color: Theme.ink-4;
-                }
-            }
-            Rectangle { width: 6px; }
-            VerticalLayout {
+            if root.messages.length > 0: VerticalLayout {
                 alignment: center;
                 IconButton {
                     source: Icons.trash;
@@ -1006,11 +1042,52 @@ export component AppWindow inherits Window {
                         horizontal-alignment: center;
                     }
                     Text {
-                        text: "说“" + (root.wake-words == "" ? "你好电脑" : root.wake-words) + "”唤醒我，或者点下方的光球";
+                        text: !root.listening-enabled ? "语音唤醒已暂停，点下方的光球直接说话"
+                            : "说“" + root.first-wake-word + "”唤醒我，或者点下方的光球";
                         font-size: 13px;
                         color: Theme.ink-3;
                         horizontal-alignment: center;
                         wrap: word-wrap;
+                    }
+                }
+                // 还没填百炼的 key：语音对话用不了，先引导去设置
+                if root.asr-key-state == 0: HorizontalLayout {
+                    alignment: center;
+                    Rectangle {
+                        max-width: 360px;
+                        background: Theme.surface;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: Theme.hairline;
+                        HorizontalLayout {
+                            padding: 14px;
+                            spacing: 12px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: center;
+                                spacing: 3px;
+                                Text {
+                                    text: "还差一步：填写 API Key";
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: Theme.ink;
+                                }
+                                Text {
+                                    text: "语音对话需要阿里云百炼的 key；现在也可以先打字使用";
+                                    font-size: 11px;
+                                    color: Theme.ink-3;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Btn {
+                                    text: "去设置";
+                                    kind: 0;
+                                    clicked => { root.page = 1; }
+                                }
+                            }
+                        }
                     }
                 }
                 HorizontalLayout {
@@ -1033,7 +1110,7 @@ export component AppWindow inherits Window {
                         clicked => { root.send-text(self.text); }
                     }
                     SuggestionChip {
-                        text: "大声一点";
+                        text: "在 B 站搜索 Python 教程";
                         clicked => { root.send-text(self.text); }
                     }
                 }
@@ -1076,9 +1153,11 @@ export component AppWindow inherits Window {
             TextField {
                 height: 40px;
                 radius: 20px;
-                placeholder: "输入命令，回车发送";
+                placeholder: "输入命令，回车发送，Esc 收起";
                 text <=> root.draft;
+                init => { self.focus-input(); }
                 accepted => { root.submit(); }
+                escaped => { root.show-keyboard = false; }
             }
             VerticalLayout {
                 alignment: center;
@@ -1188,7 +1267,7 @@ export component AppWindow inherits Window {
                 alignment: center;
                 IconButton {
                     source: Icons.back;
-                    clicked => { root.page = 0; }
+                    clicked => { root.leave-settings(); }
                 }
             }
             Text {
@@ -1265,7 +1344,7 @@ export component AppWindow inherits Window {
                     Divider { }
                     FieldBlock {
                         title: "实时语音模型";
-                        hint: "用上面“语音识别”里的阿里云百炼 key。qwen-audio-3.1-realtime-flash 更便宜。";
+                        hint: "使用下方“语音识别”里填写的阿里云百炼 key。qwen-audio-3.1-realtime-flash 更便宜。";
                         TextField { text <=> root.realtime-model; }
                     }
                     Divider { }
@@ -1300,6 +1379,7 @@ export component AppWindow inherits Window {
                         detail: root.llm-key-status;
                         placeholder: "粘贴新的 key（留空表示不修改）";
                         hint: "在 platform.deepseek.com 的 API keys 页面创建。key 用 Windows 加密保存在本机，界面上不再显示。";
+                        saved: root.llm-key-saved;
                         input <=> root.llm-key-input;
                         test => { root.test-llm(); }
                         clear => { root.clear-llm-key(); }
@@ -1361,6 +1441,7 @@ export component AppWindow inherits Window {
                         detail: root.asr-key-status;
                         placeholder: "粘贴新的 key（留空表示不修改）";
                         hint: "在 bailian.console.aliyun.com 的 API-KEY 页面创建。约 1.2 元/小时，只在唤醒后上传音频。";
+                        saved: root.asr-key-saved;
                         input <=> root.asr-key-input;
                         test => { root.test-asr(); }
                         clear => { root.clear-asr-key(); }
@@ -1595,13 +1676,22 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                HorizontalLayout {
-                    alignment: center;
+                VerticalLayout {
                     padding-top: 4px;
-                    Btn {
-                        text: "恢复默认设置";
-                        kind: 2;
-                        clicked => { root.reset-settings(); }
+                    spacing: 2px;
+                    HorizontalLayout {
+                        alignment: center;
+                        Btn {
+                            text: "恢复默认设置";
+                            kind: 2;
+                            clicked => { root.reset-settings(); }
+                        }
+                    }
+                    if root.memory != "": Text {
+                        text: "当前" + root.memory;
+                        font-size: 11px;
+                        color: Theme.ink-4;
+                        horizontal-alignment: center;
                     }
                 }
             }
@@ -1621,16 +1711,37 @@ export component AppWindow inherits Window {
             spacing: 10px;
             Text {
                 horizontal-stretch: 1;
-                text: root.settings-note;
+                text: root.leave-pending ? "更改还没有保存"
+                    : root.settings-note != "" ? root.settings-note
+                    : root.settings-dirty ? "有未保存的更改" : "";
                 font-size: 12px;
-                color: Theme.ok;
+                color: root.leave-pending || (root.settings-note == "" && root.settings-dirty) ? Theme.warn
+                    : root.note-kind == 1 ? Theme.danger
+                    : root.note-kind == 0 ? Theme.ok : Theme.ink-3;
                 vertical-alignment: center;
-                overflow: elide;
+                wrap: word-wrap;
+            }
+            if root.leave-pending: Btn {
+                text: "放弃更改";
+                kind: 2;
+                clicked => {
+                    root.discard-settings();
+                    root.leave-pending = false;
+                    root.page = 0;
+                }
             }
             Btn {
                 text: "保存并应用";
                 kind: 0;
-                clicked => { root.save-settings(); }
+                clicked => {
+                    root.save-settings();
+                    // 保存失败（比如校验没通过）时留在设置页，让人看到原因
+                    if (root.leave-pending && !root.settings-dirty) {
+                        root.settings-note = "";
+                        root.page = 0;
+                    }
+                    root.leave-pending = false;
+                }
             }
         }
     }

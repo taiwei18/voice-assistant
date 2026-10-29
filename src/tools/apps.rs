@@ -107,8 +107,33 @@ pub fn search_url(query: &str, engine: &str) -> String {
         "google" => format!("https://www.google.com/search?q={q}"),
         "bilibili" => format!("https://search.bilibili.com/all?keyword={q}"),
         "zhihu" => format!("https://www.zhihu.com/search?q={q}"),
+        "douyin" => format!("https://www.douyin.com/search/{q}"),
+        "xiaohongshu" => format!("https://www.xiaohongshu.com/search_result?keyword={q}"),
+        "taobao" => format!("https://s.taobao.com/search?q={q}"),
+        "jd" => format!("https://search.jd.com/Search?keyword={q}"),
+        "youtube" => format!("https://www.youtube.com/results?search_query={q}"),
+        "github" => format!("https://github.com/search?q={q}"),
         _ => format!("https://www.bing.com/search?q={q}"),
     }
+}
+
+/// 口语里的网站名 → web_search 的 engine
+pub fn site_engine(name: &str) -> Option<&'static str> {
+    let n = name.trim().to_lowercase().replace(' ', "");
+    Some(match n.as_str() {
+        "抖音" | "douyin" => "douyin",
+        "b站" | "哔哩哔哩" | "bilibili" | "b 站" => "bilibili",
+        "小红书" => "xiaohongshu",
+        "淘宝" => "taobao",
+        "京东" => "jd",
+        "知乎" => "zhihu",
+        "百度" => "baidu",
+        "必应" | "bing" => "bing",
+        "谷歌" | "google" => "google",
+        "youtube" | "油管" => "youtube",
+        "github" => "github",
+        _ => return None,
+    })
 }
 
 pub fn definitions() -> Vec<Value> {
@@ -125,10 +150,10 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "web_search",
-            "description": "在用户的默认浏览器里打开搜索结果页，读不到页面内容。用户只是想自己看搜索结果时用。",
+            "description": "在用户自己的默认浏览器里（带着用户的登录状态）打开某个网站的搜索结果页，一步完成，读不到页面内容。用户说“在抖音/B站/小红书/淘宝/京东/知乎/YouTube/GitHub 上搜 X”或“打开抖音搜 X”时用对应的 engine；只说“搜一下 X”用 bing。",
             "input_schema": {"type": "object", "properties": {
                 "query": {"type": "string"},
-                "engine": {"type": "string", "enum": ["bing", "baidu", "google", "bilibili", "zhihu"]}
+                "engine": {"type": "string", "enum": ["bing", "baidu", "google", "bilibili", "zhihu", "douyin", "xiaohongshu", "taobao", "jd", "youtube", "github"]}
             }, "required": ["query"]}
         }),
         json!({

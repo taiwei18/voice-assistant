@@ -11,3 +11,6 @@ models/
 .env.*
 *.pem
 *.key
+
+# 个人使用记录
+/AI_LOG.md

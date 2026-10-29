@@ -12,7 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 const MAX_ELEMENTS: usize = 150;
 const MAX_VISITED: usize = 3000;
-const OWN_WINDOW: &str = "AI 语音助手";
+const OWN_WINDOW: &str = "VOA"; // 和主窗口标题一致
 
 type Job = (String, Value, oneshot::Sender<(String, bool)>);
 

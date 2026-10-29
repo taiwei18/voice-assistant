@@ -59,7 +59,7 @@ fn main() -> anyhow::Result<()> {
 
     let icon = icon_rgba();
     let window = AppWindow::new()?;
-    window.set_app_icon(slint::Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&icon, 32, 32)));
+    window.set_app_icon(slint::Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(include_bytes!("../assets/app-64.rgba"), 64, 64)));
     window.set_messages(ModelRc::from(Rc::new(VecModel::<ChatItem>::default())));
     let devices = Rc::new(RefCell::new(audio::input_device_names()));
     apply_config(&window, &cfg, &devices.borrow());
@@ -85,6 +85,7 @@ fn main() -> anyhow::Result<()> {
 
     wire_chat(&window, &cmd_tx);
     wire_settings(&window, &cmd_tx, devices, runtime.handle().clone());
+    mark_settings_clean(&window);
     let _tray = create_tray(&window, cmd_tx.clone(), icon)?;
 
     // 悬浮球：单击展开主界面，关掉主界面再缩回悬浮球
@@ -101,7 +102,7 @@ fn main() -> anyhow::Result<()> {
     if let Err(e) = created {
         eprintln!("悬浮球创建失败：{e}");
     }
-    ball::set_listening(cfg.listen_on_start);
+    sync_listening_menus(cfg.listen_on_start);
     window.window().on_close_requested(|| {
         ball::show_if_enabled();
         slint::CloseRequestResponse::HideWindow
@@ -112,6 +113,17 @@ fn main() -> anyhow::Result<()> {
     window.on_theme_changed(move || {
         if let Some(w) = weak.upgrade() {
             sync_title_bar(&w);
+        }
+    });
+
+    // 设置页打开时检查有没有未保存的更改
+    let settings_timer = slint::Timer::default();
+    let weak = window.as_weak();
+    settings_timer.start(slint::TimerMode::Repeated, Duration::from_millis(250), move || {
+        if let Some(w) = weak.upgrade() {
+            if w.get_page() == 1 && w.window().is_visible() {
+                update_settings_dirty(&w);
+            }
         }
     });
 
@@ -140,7 +152,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 用录音文件测试唤醒词：voice-assistant.exe --kws-test a.wav b.wav ...
+/// 用录音文件测试唤醒词：voa.exe --kws-test a.wav b.wav ...
 fn kws_test(files: &[String]) -> anyhow::Result<()> {
     let cfg = config::load();
     let (mut detector, problems) =
@@ -174,6 +186,7 @@ fn on_ui_event(w: &AppWindow, ev: UiEvent) {
     match &ev {
         UiEvent::Status(s) => println!("[状态] {s:?}"),
         UiEvent::Chat(role, text) => println!("[{role:?}] {text}"),
+        UiEvent::TaskProgress(id, text) => println!("[任务 #{id}] {text}"),
         UiEvent::Mic(name) => println!("[麦克风] {name}"),
         UiEvent::Partial(_) => {}
     }
@@ -184,23 +197,36 @@ fn on_ui_event(w: &AppWindow, ev: UiEvent) {
         }
         UiEvent::Partial(p) => w.set_partial(p.into()),
         UiEvent::Mic(name) => w.set_mic_name(name.into()),
-        UiEvent::Chat(role, text) => {
-            let model = w.get_messages();
-            if let Some(vm) = model.as_any().downcast_ref::<VecModel<ChatItem>>() {
-                vm.push(ChatItem { role: role as i32, text: text.into() });
-                if vm.row_count() > MAX_CHAT_ITEMS {
-                    vm.remove(0);
-                }
+        UiEvent::Chat(role, text) => push_chat(w, role as i32, text, None),
+        UiEvent::TaskProgress(id, text) => push_chat(w, assistant::Role::Tool as i32, format!("任务 #{id} · {text}"), Some(id)),
+    }
+}
+
+/// 追加一条对话；replace_task 为某个任务的进展时，紧挨着的上一条同任务进展会被原地替换
+fn push_chat(w: &AppWindow, role: i32, text: String, replace_task: Option<u32>) {
+    let model = w.get_messages();
+    let Some(vm) = model.as_any().downcast_ref::<VecModel<ChatItem>>() else { return };
+    let item = ChatItem { role, text: text.into() };
+    let last = vm.row_count().checked_sub(1);
+    let same_task = |prev: &ChatItem| {
+        replace_task.is_some_and(|id| prev.role == role && prev.text.starts_with(&format!("任务 #{id} · ")))
+    };
+    match last {
+        Some(i) if vm.row_data(i).is_some_and(|prev| same_task(&prev)) => vm.set_row_data(i, item),
+        _ => {
+            vm.push(item);
+            if vm.row_count() > MAX_CHAT_ITEMS {
+                vm.remove(0);
             }
-            // 等布局更新后再滚到底
-            let weak = w.as_weak();
-            slint::Timer::single_shot(Duration::from_millis(30), move || {
-                if let Some(w) = weak.upgrade() {
-                    w.invoke_scroll_to_bottom();
-                }
-            });
         }
     }
+    // 等布局更新后再滚到底
+    let weak = w.as_weak();
+    slint::Timer::single_shot(Duration::from_millis(30), move || {
+        if let Some(w) = weak.upgrade() {
+            w.invoke_scroll_to_bottom();
+        }
+    });
 }
 
 fn wire_chat(window: &AppWindow, cmd_tx: &UnboundedSender<Command>) {
@@ -214,7 +240,7 @@ fn wire_chat(window: &AppWindow, cmd_tx: &UnboundedSender<Command>) {
     });
     let tx = cmd_tx.clone();
     window.on_toggle_listening(move |on| {
-        ball::set_listening(on);
+        sync_listening_menus(on);
         let _ = tx.send(Command::SetListening(on));
     });
     let tx = cmd_tx.clone();
@@ -260,6 +286,8 @@ fn refresh_key_status(w: &AppWindow, c: &Config) {
     w.set_asr_key_status(config::key_status(&c.asr_api_key_protected, &c.asr_key_env).into());
     w.set_llm_key_state(if config::llm_key(c).is_some() { KEY_READY } else { KEY_MISSING });
     w.set_asr_key_state(if config::asr_key(c).is_some() { KEY_READY } else { KEY_MISSING });
+    w.set_llm_key_saved(config::has_saved_key(&c.llm_api_key_protected));
+    w.set_asr_key_saved(config::has_saved_key(&c.asr_api_key_protected));
 }
 
 /// 配置 -> 界面（key 本身从不显示，只显示状态）
@@ -276,6 +304,9 @@ fn apply_config(w: &AppWindow, c: &Config, devices: &[String]) {
     w.set_asr_silence_ms(c.asr_sentence_silence_ms as i32);
     w.set_asr_timeout_secs(c.asr_speech_timeout_secs as i32);
     w.set_wake_words(c.wake_words.join("，").into());
+    if let Some(first) = c.wake_words.first() {
+        w.set_first_wake_word(first.as_str().into());
+    }
     w.set_sensitivity(threshold_to_sensitivity(c.kws_threshold));
     w.set_kws_score(c.kws_score);
     w.set_follow_up(c.follow_up);
@@ -306,6 +337,11 @@ fn apply_config(w: &AppWindow, c: &Config, devices: &[String]) {
 /// 界面 -> 配置（以已保存的配置为底，保留 key 和界面上没有的项）
 fn read_settings(w: &AppWindow, devices: &[String]) -> Config {
     let mut c = config::load();
+    fill_settings(w, devices, &mut c);
+    c
+}
+
+fn fill_settings(w: &AppWindow, devices: &[String], c: &mut Config) {
     let text = |s: slint::SharedString| s.trim().to_string();
     c.llm_base_url = text(w.get_llm_base_url());
     c.llm_model = text(w.get_llm_model());
@@ -344,8 +380,51 @@ fn read_settings(w: &AppWindow, devices: &[String]) -> Config {
     c.realtime_voice = text(w.get_realtime_voice());
     c.barge_in = w.get_barge_in();
     c.full_duplex = w.get_full_duplex();
-    c.theme =THEMES[w.global::<Theme>().get_scheme().clamp(0, 2) as usize].into();
-    c
+    c.theme = THEMES[w.global::<Theme>().get_scheme().clamp(0, 2) as usize].into();
+}
+
+thread_local! {
+    /// 上次载入或保存时设置页的样子，用来判断有没有未保存的更改
+    static SETTINGS_BASELINE: RefCell<Option<serde_json::Value>> = const { RefCell::new(None) };
+}
+
+/// 设置页上所有可编辑内容的快照（不含悬浮球位置等界面外的项）
+fn settings_snapshot(w: &AppWindow) -> serde_json::Value {
+    let mut c = Config::default();
+    fill_settings(w, &[], &mut c);
+    serde_json::json!({
+        "config": serde_json::to_value(&c).unwrap_or_default(),
+        "device": w.get_device_index(),
+        "autostart": w.get_launch_at_login(),
+        "keys": [w.get_llm_key_input().trim(), w.get_asr_key_input().trim()],
+    })
+}
+
+/// 当前界面上的设置就是已保存的状态
+fn mark_settings_clean(w: &AppWindow) {
+    SETTINGS_BASELINE.set(Some(settings_snapshot(w)));
+    w.set_settings_dirty(false);
+}
+
+/// 设置页打开时定时比较，有改动就提示“未保存”
+fn update_settings_dirty(w: &AppWindow) {
+    let dirty = SETTINGS_BASELINE.with_borrow(|b| b.as_ref().is_some_and(|b| *b != settings_snapshot(w)));
+    if dirty != w.get_settings_dirty() {
+        w.set_settings_dirty(dirty);
+        if dirty {
+            set_note(w, NOTE_INFO, "");
+        }
+    }
+}
+
+/// 设置页底部提示：成功 / 出错 / 普通说明
+const NOTE_OK: i32 = 0;
+const NOTE_ERROR: i32 = 1;
+const NOTE_INFO: i32 = 2;
+
+fn set_note(w: &AppWindow, kind: i32, text: impl Into<slint::SharedString>) {
+    w.set_note_kind(kind);
+    w.set_settings_note(text.into());
 }
 
 /// 设置页“谁来干活”下面的说明：命令行装没装
@@ -383,7 +462,7 @@ fn wire_settings(window: &AppWindow, cmd_tx: &UnboundedSender<Command>, devices:
         let Some(w) = weak.upgrade() else { return };
         let mut c = read_settings(&w, &devs.borrow());
         if let Some(problem) = validate(&c) {
-            w.set_settings_note(problem.into());
+            set_note(&w, NOTE_ERROR, problem);
             return;
         }
         for (input, slot) in [
@@ -394,7 +473,7 @@ fn wire_settings(window: &AppWindow, cmd_tx: &UnboundedSender<Command>, devices:
                 match config::protect_key(&input) {
                     Some(protected) => *slot = protected,
                     None => {
-                        w.set_settings_note("key 加密保存失败".into());
+                        set_note(&w, NOTE_ERROR, "key 加密保存失败");
                         return;
                     }
                 }
@@ -406,15 +485,16 @@ fn wire_settings(window: &AppWindow, cmd_tx: &UnboundedSender<Command>, devices:
                 w.set_asr_key_input("".into());
                 refresh_key_status(&w, &c);
                 ball::set_enabled(c.float_ball);
-                let note = match sys::set_autostart(w.get_launch_at_login()) {
-                    Ok(()) => "已保存并生效".to_string(),
-                    Err(e) => format!("已保存，但开机自启设置失败：{e}"),
+                let (kind, note) = match sys::set_autostart(w.get_launch_at_login()) {
+                    Ok(()) => (NOTE_OK, "已保存并生效".to_string()),
+                    Err(e) => (NOTE_ERROR, format!("已保存，但开机自启设置失败：{e}")),
                 };
                 w.set_launch_at_login(sys::autostart_enabled());
-                w.set_settings_note(note.into());
+                mark_settings_clean(&w);
+                set_note(&w, kind, note);
                 let _ = tx.send(Command::Reload(c));
             }
-            Err(e) => w.set_settings_note(format!("保存失败：{e}").into()),
+            Err(e) => set_note(&w, NOTE_ERROR, format!("保存失败：{e}")),
         }
     });
 
@@ -429,7 +509,17 @@ fn wire_settings(window: &AppWindow, cmd_tx: &UnboundedSender<Command>, devices:
             ..Config::default()
         };
         apply_config(&w, &defaults, &devs.borrow());
-        w.set_settings_note("已恢复默认值（API key 保留），点“保存并应用”生效".into());
+        update_settings_dirty(&w);
+        set_note(&w, NOTE_INFO, "已恢复默认值（API key 保留），点“保存并应用”生效");
+    });
+
+    // 放弃未保存的更改：界面回到已保存的配置
+    let (weak, devs) = (window.as_weak(), devices.clone());
+    window.on_discard_settings(move || {
+        let Some(w) = weak.upgrade() else { return };
+        apply_config(&w, &config::load(), &devs.borrow());
+        mark_settings_clean(&w);
+        set_note(&w, NOTE_INFO, "");
     });
 
     // 刷新麦克风列表（插拔设备后）
@@ -440,7 +530,7 @@ fn wire_settings(window: &AppWindow, cmd_tx: &UnboundedSender<Command>, devices:
         let current = if idx > 0 { devs.borrow().get(idx as usize - 1).cloned().unwrap_or_default() } else { String::new() };
         *devs.borrow_mut() = audio::input_device_names();
         set_devices(&w, &devs.borrow(), &current);
-        w.set_settings_note(format!("找到 {} 个麦克风", devs.borrow().len()).into());
+        set_note(&w, NOTE_INFO, format!("找到 {} 个麦克风", devs.borrow().len()));
     });
 
     // 清除已保存的 key
@@ -452,7 +542,7 @@ fn wire_settings(window: &AppWindow, cmd_tx: &UnboundedSender<Command>, devices:
             if asr { c.asr_api_key_protected.clear() } else { c.llm_api_key_protected.clear() }
             if config::save(&c).is_ok() {
                 refresh_key_status(&w, &c);
-                w.set_settings_note("已清除保存的 key".into());
+                set_note(&w, NOTE_OK, "已清除保存的 key");
                 let _ = tx.send(Command::Reload(c));
             }
         };
@@ -604,15 +694,33 @@ fn open_from_ball(w: &AppWindow) {
 fn toggle_listening(w: &AppWindow, tx: &UnboundedSender<Command>) {
     let on = !w.get_listening_enabled();
     w.set_listening_enabled(on);
-    ball::set_listening(on);
+    sync_listening_menus(on);
     let _ = tx.send(Command::SetListening(on));
+}
+
+thread_local! {
+    static TRAY_TOGGLE: RefCell<Option<tray_icon::menu::MenuItem>> = const { RefCell::new(None) };
+}
+
+/// 悬浮球和托盘菜单里的“暂停 / 恢复语音唤醒”跟着当前状态走
+fn sync_listening_menus(on: bool) {
+    ball::set_listening(on);
+    TRAY_TOGGLE.with_borrow(|item| {
+        if let Some(item) = item {
+            item.set_text(if on { "暂停语音唤醒" } else { "恢复语音唤醒" });
+        }
+    });
 }
 
 fn set_float_ball(w: &AppWindow, on: bool) {
     let mut c = config::load();
     c.float_ball = on;
     let _ = config::save(&c);
+    let dirty = w.get_settings_dirty();
     w.set_float_ball(on);
+    if !dirty {
+        mark_settings_clean(w);
+    }
     ball::set_enabled(on);
     if on && !w.window().is_visible() {
         ball::set_visible(true);
@@ -647,11 +755,12 @@ fn create_tray(window: &AppWindow, cmd_tx: UnboundedSender<Command>, icon: Vec<u
 
     let menu = Menu::new();
     let open = MenuItem::new("打开主界面", true, None);
-    let toggle = MenuItem::new("暂停 / 恢复语音唤醒", true, None);
+    let toggle = MenuItem::new("暂停语音唤醒", true, None);
     let show_ball = MenuItem::new("显示悬浮球", true, None);
     let quit = MenuItem::new("退出", true, None);
     menu.append_items(&[&open, &toggle, &show_ball, &PredefinedMenuItem::separator(), &quit])?;
     let ids = (open.id().clone(), toggle.id().clone(), show_ball.id().clone(), quit.id().clone());
+    TRAY_TOGGLE.set(Some(toggle.clone()));
 
     let weak = window.as_weak();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
@@ -684,34 +793,14 @@ fn create_tray(window: &AppWindow, cmd_tx: UnboundedSender<Command>, icon: Vec<u
     }));
 
     Ok(TrayIconBuilder::new()
-        .with_tooltip("AI 语音助手")
+        .with_tooltip("VOA 语音助手")
         .with_icon(tray_icon::Icon::from_rgba(icon, 32, 32)?)
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
         .build()?)
 }
 
-/// 程序图标：蓝色圆底 + 白色麦克风，直接画出来，不用附带图片文件
+/// 托盘与 Windows 应用图标使用同一份品牌图形。
 fn icon_rgba() -> Vec<u8> {
-    const S: usize = 32;
-    let mut rgba = vec![0u8; S * S * 4];
-    for y in 0..S {
-        for x in 0..S {
-            let (fx, fy) = (x as f32 + 0.5 - 16.0, y as f32 + 0.5 - 16.0);
-            if (fx * fx + fy * fy).sqrt() > 15.5 {
-                continue;
-            }
-            let capsule = fx.abs() <= 4.0 && (-6.0..=2.0).contains(&fy)
-                || (fx * fx + (fy + 6.0).powi(2)).sqrt() <= 4.0
-                || (fx * fx + (fy - 2.0).powi(2)).sqrt() <= 4.0;
-            let arc = {
-                let d = (fx * fx + (fy - 1.0).powi(2)).sqrt();
-                (6.0..=7.6).contains(&d) && fy >= 1.0
-            };
-            let stem = fx.abs() <= 1.0 && (8.0..=11.0).contains(&fy) || fx.abs() <= 4.5 && (10.5..=12.0).contains(&fy);
-            let px = if capsule || arc || stem { [255, 255, 255, 255] } else { [37, 99, 235, 255] };
-            rgba[(y * S + x) * 4..(y * S + x) * 4 + 4].copy_from_slice(&px);
-        }
-    }
-    rgba
+    include_bytes!("../assets/app-32.rgba").to_vec()
 }

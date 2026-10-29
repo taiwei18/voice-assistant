@@ -58,6 +58,8 @@ pub enum UiEvent {
     Status(Status),
     Partial(String),
     Chat(Role, String),
+    /// 后台任务的最新进展：连续的进展只占一行，原地更新
+    TaskProgress(u32, String),
     Mic(String),
 }
 
@@ -95,8 +97,8 @@ pub async fn run(cfg: Config, mut rx: UnboundedReceiver<Command>, cmd_tx: Unboun
     let (audio_tx, audio_rx) = unbounded_channel();
     let (done_tx, done_rx) = unbounded_channel();
     let tasks = TaskManager::new(done_tx, ui.clone());
-    let front_tools = Arc::new(Tools::front(apps.clone(), tasks.clone()));
     let mut a = Assistant {
+        front_tools: Arc::new(Tools::local_only(apps.clone())), // 马上由 apply_config 换成正式的
         listening: cfg.listen_on_start,
         agent: None,
         cfg,
@@ -105,7 +107,6 @@ pub async fn run(cfg: Config, mut rx: UnboundedReceiver<Command>, cmd_tx: Unboun
         apps,
         tasks,
         done_rx,
-        front_tools,
         tts: Tts::new(),
         ear: None,
         audio_tx,
@@ -120,11 +121,12 @@ pub async fn run(cfg: Config, mut rx: UnboundedReceiver<Command>, cmd_tx: Unboun
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    Command::Wake(word) => {
+                    Command::Wake(_word) => {
                         // 耳朵检测到唤醒词时会立刻切到录音模式；如果此后模式被改过（比如期间在处理别的命令），这个唤醒已过时
                         let fresh = a.ear.as_ref().is_some_and(|e| e.mode.load(Ordering::SeqCst) == MODE_CAPTURE);
                         if a.listening && fresh {
-                            a.chat(Role::System, format!("（唤醒：{word}）"));
+                            #[cfg(debug_assertions)]
+                            println!("[唤醒] {_word}");
                             a.conversation(None).await;
                         }
                     }
@@ -184,9 +186,10 @@ impl Assistant {
         self.emit(UiEvent::Status(if self.listening { Status::Idle } else { Status::Paused }));
     }
 
-    /// 根据配置重建前台助手和后台任务设置
+    /// 根据配置重建工具、前台助手和后台任务设置
     fn apply_config(&mut self) {
         let full_tools = Arc::new(Tools::new(&self.cfg, self.apps.clone()));
+        self.front_tools = Arc::new(full_tools.with_tasks(self.tasks.clone()));
         self.tasks.update_settings(TaskSettings::from_config(&self.cfg, full_tools));
         self.agent = self.build_agent();
     }
@@ -239,7 +242,6 @@ impl Assistant {
             self.restart_ear();
         }
         self.go_idle();
-        self.chat(Role::System, "设置已生效。");
     }
 
     fn realtime_enabled(&self) -> bool {
@@ -277,7 +279,7 @@ impl Assistant {
 
     /// 后台任务做完了：主动告诉用户
     async fn announce(&mut self, done: TaskDone) {
-        let text = if done.ok { format!("任务{}做完了：{}", done.id, done.text) } else { format!("任务{}没做成：{}", done.id, done.text) };
+        let text = if done.ok { format!("任务{}返回结果：{}", done.id, done.text) } else { format!("任务{}没做成：{}", done.id, done.text) };
         self.conversation(Some(text)).await;
     }
 
@@ -341,13 +343,16 @@ impl Assistant {
             let ui = self.ui.clone();
             let on_tool = |name: &str, input: &Value| {
                 ui(UiEvent::Status(Status::Acting));
-                ui(UiEvent::Chat(Role::Tool, describe_tool(name, input)));
+                let text = describe_tool(name, input);
+                if !text.is_empty() {
+                    ui(UiEvent::Chat(Role::Tool, text));
+                }
             };
             match agent.ask(text, on_tool).await {
                 Ok(r) => r,
                 Err(e) => {
                     (self.ui)(UiEvent::Chat(Role::System, format!("{e:#}")));
-                    "出错了，请再试一次。".into()
+                    format!("这次没能确认完成：{e}。")
                 }
             }
         } else {
@@ -505,8 +510,13 @@ impl Assistant {
                                 self.emit(UiEvent::Status(Status::Acting));
                                 for (call_id, name, arguments) in std::mem::take(&mut calls) {
                                     let input: Value = serde_json::from_str(&arguments).unwrap_or_default();
-                                    self.chat(Role::Tool, describe_tool(&name, &input));
+                                    let text = describe_tool(&name, &input);
+                                    if !text.is_empty() {
+                                        self.chat(Role::Tool, text);
+                                    }
                                     let (output, _) = self.front_tools.call(&name, &input).await;
+                                    // 网页结构可能很长，实时模型的上下文有限，截短一些
+                                    let output: String = output.chars().take(8000).collect();
                                     session.send_function_output(&call_id, &output).await?;
                                 }
                                 responding = true;
@@ -520,7 +530,7 @@ impl Assistant {
                 }
                 done = self.done_rx.recv() => {
                     if let Some(done) = done {
-                        let text = if done.ok { format!("任务{}做完了：{}", done.id, done.text) } else { format!("任务{}没做成：{}", done.id, done.text) };
+                        let text = if done.ok { format!("任务{}返回结果：{}", done.id, done.text) } else { format!("任务{}没做成：{}", done.id, done.text) };
                         self.chat(Role::System, format!("（后台任务通知）{text}"));
                         let text = format!("（这是系统通知，不是用户说的话）{text}。请用一两句话口语化地告诉用户这个结果。");
                         if responding || user_speaking {
@@ -578,8 +588,74 @@ impl Assistant {
     }
 }
 
+/// 工具调用在对话里显示成一句人话；返回空字符串表示不单独显示（后台任务自己会报告）
 pub fn describe_tool(name: &str, input: &Value) -> String {
-    let args = input.to_string();
-    let args: String = args.chars().take(80).collect();
-    format!("{name} {args}")
+    let arg = |key: &str| -> String {
+        let v = match &input[key] {
+            Value::String(s) => s.trim().to_string(),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        };
+        let short: String = v.chars().take(40).collect();
+        if short.chars().count() < v.chars().count() { format!("{short}…") } else { short }
+    };
+    let with = |verb: &str, value: String| if value.is_empty() { verb.to_string() } else { format!("{verb}：{value}") };
+    match name {
+        "start_task" | "resume_task" | "cancel_task" => String::new(),
+        "task_status" => "查看后台任务进度".into(),
+        "launch_app" => with("打开应用", arg("name")),
+        "find_apps" => with("查找应用", arg("keyword")),
+        "web_search" => with("搜索", arg("query")),
+        "open_url" | "browser_navigate" => with("打开网页", arg("url")),
+        "current_time" => "查看时间".into(),
+        "media_control" => match input["action"].as_str().unwrap_or("") {
+            "volume_up" => "调大音量".into(),
+            "volume_down" => "调小音量".into(),
+            "mute" => "静音".into(),
+            "play_pause" => "播放 / 暂停".into(),
+            "next" => "下一首".into(),
+            "previous" => "上一首".into(),
+            _ => "控制媒体播放".into(),
+        },
+        "close_app" => with("关闭", arg("name")),
+        "list_processes" => with("查看正在运行的程序", arg("keyword")),
+        "desktop_windows" => "查看打开的窗口".into(),
+        "desktop_focus" => with("切换到窗口", arg("name")),
+        "desktop_snapshot" => with("读取窗口内容", arg("window")),
+        "desktop_click" => if input["double"].as_bool() == Some(true) { "双击".into() } else { "点击".into() },
+        "desktop_type" | "browser_type" => with("输入", arg("text")),
+        "desktop_keys" | "browser_press_key" => with("按键", arg(if name == "desktop_keys" { "keys" } else { "key" })),
+        "browser_navigate_back" => "网页后退".into(),
+        "browser_snapshot" => "读取网页内容".into(),
+        "browser_click" => with("点击网页", arg("element")),
+        "browser_hover" => with("指向", arg("element")),
+        "browser_fill_form" => "填写表单".into(),
+        "browser_select_option" => with("选择", arg("element")),
+        "browser_find" => with("在网页里查找", arg("text")),
+        "browser_tabs" => "切换浏览器标签页".into(),
+        "browser_wait_for" => "等待网页加载".into(),
+        "browser_handle_dialog" => "处理网页弹窗".into(),
+        "browser_close" => "关闭浏览器".into(),
+        _ => {
+            let args: String = input.to_string().chars().take(60).collect();
+            format!("{name} {args}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::describe_tool;
+    use serde_json::json;
+
+    #[test]
+    fn tool_descriptions_are_readable() {
+        assert_eq!(describe_tool("launch_app", &json!({"name": "计算器"})), "打开应用：计算器");
+        assert_eq!(describe_tool("media_control", &json!({"action": "volume_up"})), "调大音量");
+        assert_eq!(describe_tool("browser_snapshot", &json!({})), "读取网页内容");
+        // 后台任务自己会报告，不重复显示
+        assert_eq!(describe_tool("start_task", &json!({"task": "整理桌面"})), "");
+        let long = describe_tool("desktop_type", &json!({"text": "字".repeat(60)}));
+        assert!(long.ends_with('…') && long.chars().count() < 50);
+    }
 }
